@@ -1,0 +1,25 @@
+# Build outputs
+*.dll
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+*.log
+x64/
+Debug/
+Release/
+
+# Visual Studio local state
+.vs/
+*.user
+*.suo
+
+# Kenshi generated mod binaries; keep the source FCS payload for release.
+*.mod
+!native/toolchain/KenshiLib_Examples/TradersRefuse/TradersRefuse/Traders Refuse Irrelevant Items.mod
+
+# Local staging/output
+dist/
+package/
+/native/toolchain/KenshiLib_Examples/TradersRefuse/RE_Kenshi.json
