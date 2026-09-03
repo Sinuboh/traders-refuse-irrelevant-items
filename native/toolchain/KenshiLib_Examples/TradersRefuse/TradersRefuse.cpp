@@ -350,7 +350,6 @@ struct ShopContext
     std::set<std::string> stockNames;
     std::set<GameData*> seenVendorLists;
     std::set<std::string> vendorListNames;
-    std::set<std::string> vendorListIds;
     bool           hasGeneralTradeAllowList;
     bool           isTradeShop;
     bool           sellsRobotics;
@@ -372,7 +371,7 @@ struct ShopContext
     void clear()
     {
         shop = NULL; archetype = "_default"; foundVendorList = false; haveStock = false;
-        stockCats.clear(); stockIds.clear(); stockNames.clear(); seenVendorLists.clear(); vendorListNames.clear(); vendorListIds.clear();
+        stockCats.clear(); stockIds.clear(); stockNames.clear(); seenVendorLists.clear(); vendorListNames.clear();
         hasGeneralTradeAllowList = false; isTradeShop = false; sellsRobotics = false;
         isWeaponsOnlyShop = false; sellsArmorOrClothing = false; isBar = false; isThiefFence = false;
         isAcceptAllVendor = false; isSkeletonVendor = false; sellsFood = false;
@@ -869,7 +868,6 @@ static void addVendorTemplateRefs(GameData* vendor, ShopContext& ctx)
     if (ctx.seenVendorLists.count(vendor)) return;
     ctx.seenVendorLists.insert(vendor);
     if (!vendor->name.empty()) ctx.vendorListNames.insert(vendor->name);
-    if (!vendor->stringID.empty()) ctx.vendorListIds.insert(vendor->stringID);
 
     if (cfg::scanAllVendorRefs)
     {
@@ -925,6 +923,8 @@ static void logVendorListFound(GameData* ownerData, const std::string& memberNam
     DebugLog(buf);
 }
 
+// Folds a gamedata's vendor stock into the context: if it is itself a vendor
+// list, scan it directly; otherwise scan the vendor lists it points at.
 static void addVendorListsReferencedBy(GameData* data, ShopContext& ctx)
 {
     if (!data) return;
@@ -1122,12 +1122,6 @@ static Disp dispositionFor(Cat cat, const std::string& itemId, double* reducedMu
 }
 
 // ---------------------------------------------------------------------
-//  HOOK 1: value cue on the player's sell side
-//  InventoryItemBase::getValueSingle(bool isPlayer) is virtual, so hook the
-//  non-virtual body via &InventoryItemBase::_NV_getValueSingle. Subclasses may
-//  keep their own value path, so hard refusal must still live in add/placement.
-// ---------------------------------------------------------------------
-// ---------------------------------------------------------------------
 //  FAULT DIAGNOSTICS
 //  SEH turns a bad dereference into RE'd game memory into a logged reason +
 //  safe default, instead of crashing Kenshi. This filter records the fault
@@ -1207,6 +1201,12 @@ static std::string itemStringID(InventoryItemBase* item)
     return toLower(data->stringID);
 }
 
+// ---------------------------------------------------------------------
+//  HOOK 1: value cue on the player's sell side
+//  InventoryItemBase::getValueSingle(bool isPlayer) is virtual, so hook the
+//  non-virtual body via &InventoryItemBase::_NV_getValueSingle. Subclasses may
+//  keep their own value path, so hard refusal must still live in add/placement.
+// ---------------------------------------------------------------------
 typedef int (*GetValueSingle_t)(InventoryItemBase*, bool);
 static GetValueSingle_t GetValueSingle_orig = NULL;
 
@@ -1229,6 +1229,8 @@ static float safeTraderPriceMultiplier()
     return mult;
 }
 
+// Pre-divide by the trader's global price multiplier so the engine's own later
+// multiply lands back on the local price we actually want to pay.
 static int cancelTraderSellMultiplier(int desiredValue, float traderMult)
 {
     if (!cfg::payFullLocalPrice) return desiredValue;
@@ -1649,10 +1651,26 @@ static bool analysePlayerSaleToShop(Inventory* destInv, Item* item, int quantity
                                readable(gTrade.player, 8) &&
                                sameTradeObject(shop, gTrade.shop) &&
                                !activeTradeHadShopItem(item);
-    bool sourceIsPlayer = itemBelongsToPlayerSide(item, sourceOwner) ||
-                          activeTradeHadPlayerItem(item) ||
-                          selfOwnedContainerSale ||
-                          ownerlessPlayerSale;
+    // The shop managing its own stock is not a player sale, and the clearest
+    // tell is that the item already lives in the destination inventory. The
+    // "arrange" button (ShopTraderInventorySection::autoArrange) re-places the
+    // shop's sellable goods through the same inherited InventorySection::_addItem
+    // we hook; those goods are already members of the shop's ShopTraderInventory,
+    // whereas a genuine incoming sale item is not in the shop inventory yet.
+    // Without this, arrange looks like an ownerless player sale and the shop's
+    // own items get refused - which now destroys them (the block) instead of
+    // duplicating them (the old gift). Never treat an item the destination
+    // already holds as a player sale.
+
+    // Of note, ownerless player sales happen when a player sells a container
+    // like a backpack with items in it. In that sense the backpack owns the
+    // items. So we must have some checks for ownerless items.
+    bool itemAlreadyInDest = readable(destInv, 8) && readable(item, 8) && destInv->hasItem(item);
+    bool sourceIsPlayer = !itemAlreadyInDest &&
+                          (itemBelongsToPlayerSide(item, sourceOwner) ||
+                           activeTradeHadPlayerItem(item) ||
+                           selfOwnedContainerSale ||
+                           ownerlessPlayerSale);
 
     if (destOwnerOut) *destOwnerOut = destOwner;
     if (shopOut) *shopOut = shop;
@@ -1938,6 +1956,31 @@ static bool restoreRefusedItemToPlayerImpl(Item* item, int quantity)
     if (!readable(item, 8)) return false;
     if (!readable(gTrade.player, 8)) return false;
 
+    // Only ever hand an item back to the player if it genuinely originated on
+    // the player's side of this trade. The shop re-sorting its own sellable
+    // stock (the "arrange" button -> ShopTraderInventorySection::autoArrange,
+    // which re-places through the inherited InventorySection::_addItem we hook)
+    // looks like an ownerless drag/drop at the moment of placement. Without
+    // this gate the shop's own goods (blueprints, notices, ...) get "restored"
+    // into the player's inventory for free - and, since shop stock regenerates
+    // on the next visit, farmed indefinitely. Never restore shop-owned items.
+    RootObject* properOwner = itemProperOwner(item);
+    bool playerOriginated = activeTradeHadPlayerItem(item) || isPlayerCharacterObject(properOwner);
+    bool shopOriginated = activeTradeHadShopItem(item) || isCurrentTradeShopkeeper(properOwner);
+    if (!playerOriginated || shopOriginated)
+    {
+        if (cfg::debug)
+        {
+            char skipBuf[512];
+            _snprintf_s(skipBuf, sizeof(skipBuf), _TRUNCATE,
+                "[TRII][restore_skip] not a player-originated sale; item=%s/%p playerOriginated=%d shopOriginated=%d properOwner=%s",
+                safeName(item).c_str(), item, (int)playerOriginated, (int)shopOriginated,
+                objectSummary(properOwner).c_str());
+            DebugLog(skipBuf);
+        }
+        return false;
+    }
+
     Inventory* playerInv = gTrade.player->getInventory();
     if (!readable(playerInv, 8)) return false;
 
@@ -2152,6 +2195,65 @@ static bool ShopTraderInventorySectionAddItem_hook(ShopTraderInventorySection* s
     return ret;
 }
 
+// The "arrange" button (ShopTraderInventorySection::autoArrange) re-places the
+// shop's own sellable stock through the inherited InventorySection::_addItem we
+// hook, with the item transiently ownerless - which the ownerless-sale heuristic
+// misreads as a player sale and refuses (destroying the item). Snapshotting the
+// shop's inventory HERE, at the start of the arrange and before it mutates
+// anything, is the robust fix: it reads self->getInventory() directly (no reliance
+// on trade-open GUI state) and captures whatever is actually in the shop right now
+// - including goods the player legitimately sold earlier in this same trade, which
+// a trade-open snapshot would miss. Those pointers are stable across the re-place,
+// so activeTradeHadShopItem() then recognises them and they are not refused.
+typedef void (*ShopTraderSectionAutoArrange_t)(ShopTraderInventorySection*);
+static ShopTraderSectionAutoArrange_t ShopTraderSectionAutoArrange_orig = NULL;
+static bool gDbgShopAutoArrangeFire = false;
+
+// Defined later with the trade-context helpers; forward-declared for the hook.
+static void snapshotTradeItems(Inventory* inventory, std::set<Item*>& out);
+
+static void snapshotArrangeStockImpl(ShopTraderInventorySection* self)
+{
+    if (!readable(self, 8)) return;
+    Inventory* inv = self->getInventory();
+    if (!readable(inv, 8)) return;
+    size_t before = gTrade.shopItems.size();
+    snapshotTradeItems(inv, gTrade.shopItems);
+    if (cfg::debug)
+    {
+        char buf[256];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "[TRII][arrange_snap] section=%p inv=%p added=%d shopItemsTotal=%d",
+            self, inv, (int)(gTrade.shopItems.size() - before), (int)gTrade.shopItems.size());
+        DebugLog(buf);
+    }
+}
+
+static void snapshotArrangeStockGuarded(ShopTraderInventorySection* self)
+{
+    __try
+    {
+        snapshotArrangeStockImpl(self);
+    }
+    __except (triiSehFilter("shopAutoArrange.snapshot", GetExceptionInformation()))
+    {
+    }
+}
+
+static void ShopTraderSectionAutoArrange_hook(ShopTraderInventorySection* self)
+{
+    onceLog(gDbgShopAutoArrangeFire, "TradersRefuse: [bc] ShopTraderInventorySection::autoArrange hook first fire");
+    snapshotArrangeStockGuarded(self);
+
+    __try
+    {
+        ShopTraderSectionAutoArrange_orig(self);
+    }
+    __except (triiSehFilter("shopAutoArrange.orig", GetExceptionInformation()))
+    {
+    }
+}
+
 static bool refusalModeIs(const char* mode)
 {
     return std::string(cfg::refusalMode) == mode;
@@ -2279,7 +2381,7 @@ static const char* suicideNoteRefusalLineForRace(RaceGroup speakerRace, int coun
         default: return "Absolutely not.";
         }
     }
-    return "No. Some things aren't merchandise.";
+    return "No. I can't accept this...";
 }
 
 static void speakRefusal(Character* speaker, Item* item)
@@ -2429,6 +2531,10 @@ static void updateActiveTradeContext(ForgottenGUI* self, RootObject* a, RootObje
     resetRefusalSpeechState();
     snapshotTradeItems(playerInv, gTrade.playerItems);
     snapshotTradeItems(shopInv, gTrade.shopItems);
+    // Shop *sellable* stock (in a separate ShopTraderInventory) is captured at
+    // arrange time by the ShopTraderInventorySection::autoArrange hook instead -
+    // that reads the stock inventory directly and also catches goods sold earlier
+    // this trade, which a trade-open snapshot would miss.
 
     if (cfg::debug)
     {
@@ -2639,6 +2745,12 @@ __declspec(dllexport) void startPlugin()
         bool ok = (KenshiLib::SUCCESS == KenshiLib::AddHook(addr, ShopTraderInventorySectionAddItem_hook, &ShopTraderInventorySectionAddItem_orig));
         logAddr("ShopTraderInventorySection::addItem", addr, ok);
         if (!ok) ErrorLog("TradersRefuse: could not hook ShopTraderInventorySection::addItem");
+    }
+    {
+        intptr_t addr = KenshiLib::GetRealAddress(&ShopTraderInventorySection::_NV_autoArrange);
+        bool ok = (KenshiLib::SUCCESS == KenshiLib::AddHook(addr, ShopTraderSectionAutoArrange_hook, &ShopTraderSectionAutoArrange_orig));
+        logAddr("ShopTraderInventorySection::autoArrange", addr, ok);
+        if (!ok) ErrorLog("TradersRefuse: could not hook ShopTraderInventorySection::autoArrange");
     }
 
     {
