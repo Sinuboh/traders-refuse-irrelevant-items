@@ -8,7 +8,7 @@
 //  Acceptance is driven by the shop's real vendor lists first:
 //    - itemFunction (+ inventorySection substring) -> category
 //    - FCS VENDOR_LIST refs on the shopkeeper, squad, or building -> stock
-//    - exact stock name/category matches -> full acceptance
+//    - exact stock stringID matches -> full acceptance
 //    - special cases: off-list food at reduced value, crossbow shops buy ammo,
 //      shop inputs, and the FCS force-allow list for general trade stores
 //    - no vendor list found -> fail open to vanilla-style acceptance
@@ -76,6 +76,7 @@ namespace cfg
     static const int    refusedPreviewValue = 1;      // zero-value refused sales looked crash-prone in the UI
     static const bool   refuseUnknown       = false;  // false => allow unclassified (OTHER) items
     static const bool   useStockAcceptance  = true;   // the shop's real stock expands acceptance
+    static const bool   strictVendorStockAcceptance = true; // stock categories describe shops; exact IDs approve sales
     static const bool   scanAllVendorRefs   = true;   // inspect FCS VENDOR_LIST refs on squad/shop/building data
     static const bool   acceptAllWhenNoVendorList = true; // missing vendor data means leave vanilla trading alone
     static const double offListFoodMult     = 0.6;    // most shops will still buy food, just at a worse price
@@ -173,6 +174,26 @@ static std::string toLower(const std::string& s)
     return out;
 }
 
+static bool readable(const void* p, size_t n);
+static GameData* itemGameData(InventoryItemBase* item);
+static Cat referenceCategoryForItemID(const std::string& itemId);
+
+static Cat gameDataTypeToCat(itemType type)
+{
+    switch (type)
+    {
+    case WEAPON: return CAT_WEAPON;
+    case CROSSBOW: return CAT_RANGED;
+    case ARMOUR: return CAT_ARMOUR;
+    case CONTAINER: return CAT_BACKPACK;
+    case BLUEPRINT: return CAT_BLUEPRINT;
+    case ARTIFACTS: return CAT_ARTIFACTS;
+    case MAP_ITEM: return CAT_MAP;
+    case LIMB_REPLACEMENT: return CAT_ROBOTICS;
+    default: return CAT_OTHER;
+    }
+}
+
 static bool sectionToCat(const std::string& sectionLower, Cat* out)
 {
     for (size_t i = 0; i < sizeof(kSectionToCat) / sizeof(kSectionToCat[0]); ++i)
@@ -184,12 +205,6 @@ static bool sectionToCat(const std::string& sectionLower, Cat* out)
         }
     }
     return false;
-}
-
-static bool looksLikeMapName(const std::string& name)
-{
-    std::string lower = toLower(name);
-    return lower.find("map") != std::string::npos;
 }
 
 // ---------------------------------------------------------------------
@@ -280,15 +295,23 @@ static bool isTraderPlatoon(Character* shop)
 // ---------------------------------------------------------------------
 //  ITEM CLASSIFICATION
 // ---------------------------------------------------------------------
-// Base valuation path only sees InventoryItemBase; use itemFunction first,
-// then the inventorySection substring, then OTHER (== classifyValueItem()).
+// Base valuation path only sees InventoryItemBase; use GameData type first,
+// then itemFunction, then the inventorySection substring fallback.
 static Cat classifyByFunctionAndSection(InventoryItemBase* item)
 {
     if (!item) return CAT_OTHER;
+    GameData* data = itemGameData(item);
+    if (data)
+    {
+        Cat dc = gameDataTypeToCat(data->type);
+        if (dc != CAT_OTHER) return dc;
+        Cat rc = referenceCategoryForItemID(toLower(data->stringID));
+        if (rc != CAT_OTHER) return rc;
+    }
+
     bool mapped = false;
     Cat c = funcToCat(item->itemFunction, &mapped);
     if (mapped) return c;
-    if (looksLikeMapName(safeName((RootObject*)item))) return CAT_MAP;
     Cat sc;
     if (sectionToCat(toLower(item->inventorySection), &sc)) return sc;
     return CAT_OTHER;
@@ -298,7 +321,15 @@ static Cat classifyByFunctionAndSection(InventoryItemBase* item)
 static Cat classifyItem(Item* item)
 {
     if (!item) return CAT_OTHER;
-    if (looksLikeMapName(safeName((RootObject*)item))) return CAT_MAP;
+    GameData* data = itemGameData(item);
+    if (data)
+    {
+        Cat dc = gameDataTypeToCat(data->type);
+        if (dc != CAT_OTHER) return dc;
+        Cat rc = referenceCategoryForItemID(toLower(data->stringID));
+        if (rc != CAT_OTHER) return rc;
+    }
+
     if (item->isCrossbow()) return CAT_RANGED;
     if (item->isArmour())   return CAT_ARMOUR;
     if (item->isWeapon())   return CAT_WEAPON;
@@ -315,6 +346,7 @@ struct ShopContext
     bool           foundVendorList;
     bool           haveStock;
     std::set<Cat>  stockCats;
+    std::set<std::string> stockIds;
     std::set<std::string> stockNames;
     std::set<GameData*> seenVendorLists;
     std::set<std::string> vendorListNames;
@@ -325,27 +357,35 @@ struct ShopContext
     bool           isWeaponsOnlyShop;
     bool           sellsArmorOrClothing;
     bool           isBar;
+    bool           isThiefFence;
+    bool           isAcceptAllVendor;
+    bool           isSkeletonVendor;
+    bool           sellsFood;
     int            liveStockItems;
     int            templateStockRefs;
 
     ShopContext() : shop(NULL), archetype("_default"), foundVendorList(false), haveStock(false),
         hasGeneralTradeAllowList(false), isTradeShop(false), sellsRobotics(false),
-        isWeaponsOnlyShop(false), sellsArmorOrClothing(false), isBar(false),
+        isWeaponsOnlyShop(false), sellsArmorOrClothing(false), isBar(false), isThiefFence(false),
+        isAcceptAllVendor(false), isSkeletonVendor(false), sellsFood(false),
         liveStockItems(0), templateStockRefs(0) {}
     void clear()
     {
         shop = NULL; archetype = "_default"; foundVendorList = false; haveStock = false;
-        stockCats.clear(); stockNames.clear(); seenVendorLists.clear(); vendorListNames.clear(); vendorListIds.clear();
+        stockCats.clear(); stockIds.clear(); stockNames.clear(); seenVendorLists.clear(); vendorListNames.clear(); vendorListIds.clear();
         hasGeneralTradeAllowList = false; isTradeShop = false; sellsRobotics = false;
-        isWeaponsOnlyShop = false; sellsArmorOrClothing = false; isBar = false;
+        isWeaponsOnlyShop = false; sellsArmorOrClothing = false; isBar = false; isThiefFence = false;
+        isAcceptAllVendor = false; isSkeletonVendor = false; sellsFood = false;
         liveStockItems = 0; templateStockRefs = 0;
     }
 };
 
 static ShopContext gCtx;
 
-static bool readable(const void* p, size_t n);
-static bool isGeneralTradeAllowName(const std::string& normalisedName);
+static std::string itemStringID(InventoryItemBase* item);
+static bool isGeneralTradeAllowID(const std::string& itemId);
+static void loadReferenceLists();
+static bool setHasItemID(const std::set<std::string>& ids, const std::string& itemId);
 
 struct ActiveTradeContext
 {
@@ -406,6 +446,20 @@ static std::string normaliseName(const std::string& raw)
     return out;
 }
 
+static bool characterIsSkeleton(Character* c)
+{
+    if (!readable(c, 8)) return false;
+    RaceData* race = c->getRace();
+    if (!readable(race, 8)) return false;
+    if (race->robot) return true;
+
+    GameData* data = race->data;
+    if (!readable(data, 8)) return false;
+    std::string key = toLower(data->name + " " + data->stringID);
+    return key.find("skeleton") != std::string::npos ||
+        key.find("robot") != std::string::npos;
+}
+
 static std::string stockCatSummary(const std::set<Cat>& cats)
 {
     std::string out;
@@ -443,10 +497,10 @@ static std::string vendorListSummary(const std::set<std::string>& names)
     return out;
 }
 
-static bool nameInList(const std::string& normalisedName, const char* const* names, size_t count)
+static bool stringInList(const std::string& value, const char* const* values, size_t count)
 {
     for (size_t i = 0; i < count; ++i)
-        if (normalisedName == names[i])
+        if (value == values[i])
             return true;
     return false;
 }
@@ -466,90 +520,86 @@ static bool stockHasOnlyWeaponGoods(const std::set<Cat>& cats)
     return hasWeaponGoods;
 }
 
-static bool setContainsSubstring(const std::set<std::string>& values, const char* needle)
-{
-    for (std::set<std::string>::const_iterator it = values.begin(); it != values.end(); ++it)
-        if (it->find(needle) != std::string::npos)
-            return true;
-    return false;
-}
+static std::set<std::string> gGeneralTradeAllowIds;
+static std::set<std::string> gFoodIds;
+static std::set<std::string> gDrinkWaterIds;
+static std::set<std::string> gBookIds;
+static std::set<std::string> gUsefulBuildingMatIds;
+static std::set<std::string> gCrossbowForceIds;
+static std::set<std::string> gArmorForceIds;
+static bool gReferenceListsLoaded = false;
 
 // Identifies vendor lists that define goods general traders should accept even
 // when those items are absent from the individual shop's vendor list.
 static bool isGeneralTradeAllowList(GameData* vendor)
 {
     if (!vendor) return false;
-    std::string name = normaliseName(vendor->name);
     std::string id = toLower(vendor->stringID);
-    return name == "all trade goods" || name == "trade goods" || name == "all items reference" ||
-        id == "10-traders refuse irrelevant items.mod" ||
+    return id == "11-traders refuse irrelevant items.mod" ||
         id == "1013-gamedata.base" || id == "1386-gamedata.base";
+}
+
+static Cat referenceListCategoryHint(GameData* vendor)
+{
+    if (!vendor) return CAT_OTHER;
+    std::string id = toLower(vendor->stringID);
+    if (id == "43969-rebirth.mod") return CAT_FOOD;
+    if (id == "12-traders refuse irrelevant items.mod") return CAT_BOOZE;
+    if (id == "13-traders refuse irrelevant items.mod") return CAT_BOOK;
+    if (id == "56360-rebirth.mod") return CAT_BUILDMATS;
+    return CAT_OTHER;
 }
 
 // Allows stores to buy obvious inputs for the things they sell, plus the
 // mod-owned force-allow list for general trade stores.
-static bool isShopSpecificAcceptedGood(const std::string& itemName, Cat cat)
+static bool isShopSpecificAcceptedGood(const std::string& itemId, Cat cat)
 {
-    std::string nn = normaliseName(itemName);
-    if (nn.empty()) return false;
-
-    static const char* const roboticsInputs[] = {
-        "skeleton muscle", "motor", "robotics component", "robotics components",
-        "electrical component", "electrical components", "steel bar", "steel bars",
-        "skeleton repair kit", "skeleton repair kits", "skeleton eye", "press",
-        "power core", "generator core", "gear", "gears", "cpu unit", "capacitor", "capacitors"
-    };
-    static const char* const weaponInputs[] = {
-        "iron plates", "iron plate", "iron ore", "fabrics", "fabric", "steel bars", "steel bar"
-    };
-    static const char* const armourInputs[] = {
-        "fabric", "fabrics", "iron plates", "iron plate", "iron ore",
-        "steel bars", "steel bar", "leather", "armor plating", "armour plating"
-    };
-    static const char* const barGoods[] = {
-        "grog", "sake", "cactus rum", "bloodrum", "hashish"
+    static const char* const roboticsInputIds[] = {
+        "43395-changes_otto.mod", // Skeleton Muscle
+        "43397-changes_otto.mod", // Motor
+        "583-gamedata.base",      // Robotics Components
+        "42164-gamedata.base",    // Electrical Components
+        "579-gamedata.base",      // Steel Bars
+        "18020-gamedata.base",    // Skeleton Repair Kit
+        "45557-changes_otto.mod", // Skeleton Eye
+        "43399-changes_otto.mod", // Press
+        "43398-changes_otto.mod", // Power Core
+        "42189-rebirth.mod",      // Generator Core
+        "42318-changes_otto.mod", // Gears
+        "43394-changes_otto.mod", // CPU Unit
+        "43393-changes_otto.mod"  // Capacitor
     };
 
     if (gCtx.sellsRobotics &&
-        nameInList(nn, roboticsInputs, sizeof(roboticsInputs) / sizeof(roboticsInputs[0])))
-        return true;
-    if (gCtx.isWeaponsOnlyShop &&
-        nameInList(nn, weaponInputs, sizeof(weaponInputs) / sizeof(weaponInputs[0])))
-        return true;
-    if (gCtx.sellsArmorOrClothing &&
-        nameInList(nn, armourInputs, sizeof(armourInputs) / sizeof(armourInputs[0])))
+        stringInList(itemId, roboticsInputIds, sizeof(roboticsInputIds) / sizeof(roboticsInputIds[0])))
         return true;
     if (gCtx.isBar &&
-        (cat == CAT_FOOD || cat == CAT_BOOZE || cat == CAT_WATER ||
-         nameInList(nn, barGoods, sizeof(barGoods) / sizeof(barGoods[0]))))
+        (cat == CAT_FOOD || cat == CAT_BOOZE || cat == CAT_WATER))
+        return true;
+    if (itemId.empty()) return false;
+
+    loadReferenceLists();
+
+    if ((gCtx.isWeaponsOnlyShop || gCtx.stockCats.count(CAT_RANGED) > 0) &&
+        setHasItemID(gCrossbowForceIds, itemId))
+        return true;
+    if (gCtx.sellsArmorOrClothing && setHasItemID(gArmorForceIds, itemId))
+        return true;
+    if (gCtx.isBar &&
+        (setHasItemID(gFoodIds, itemId) || setHasItemID(gDrinkWaterIds, itemId)))
         return true;
     if (gCtx.isTradeShop &&
-        (cat == CAT_TRADEGOODS || isGeneralTradeAllowName(nn)))
+        (cat == CAT_TRADEGOODS || isGeneralTradeAllowID(itemId)))
         return true;
     return false;
 }
 
-// Robot limb shops are inconsistent in FCS naming, so infer them from either
-// explicit categories or distinctive stock/list names.
+// Robot limb shops are inconsistent in FCS naming, so infer them from stock
+// categories first. `LIMB_REPLACEMENT` stock is classified as CAT_ROBOTICS.
 static bool stockLooksLikeRobotics(const ShopContext& ctx)
 {
     return ctx.stockCats.count(CAT_ROBOTICS) > 0 ||
-        ctx.archetype == "robotics" ||
-        setContainsSubstring(ctx.vendorListNames, "robot") ||
-        setContainsSubstring(ctx.vendorListNames, "skeleton") ||
-        setContainsSubstring(ctx.vendorListNames, "limb") ||
-        setContainsSubstring(ctx.vendorListIds, "robot") ||
-        setContainsSubstring(ctx.vendorListIds, "skeleton") ||
-        setContainsSubstring(ctx.stockNames, "robot") ||
-        setContainsSubstring(ctx.stockNames, "skeleton") ||
-        setContainsSubstring(ctx.stockNames, "repair kit") ||
-        setContainsSubstring(ctx.stockNames, "klr series") ||
-        setContainsSubstring(ctx.stockNames, "economy arm") ||
-        setContainsSubstring(ctx.stockNames, "economy leg") ||
-        setContainsSubstring(ctx.stockNames, "industrial lifter arm") ||
-        setContainsSubstring(ctx.stockNames, "steady arm") ||
-        setContainsSubstring(ctx.stockNames, "thief") ||
-        setContainsSubstring(ctx.stockNames, "scout leg");
+        ctx.archetype == "robotics";
 }
 
 struct VendorStockList { const char* name; Cat cat; };
@@ -557,7 +607,9 @@ static const VendorStockList kVendorStockLists[] = {
     { "crossbows", CAT_RANGED }, { "ammo", CAT_AMMO }, { "ammunition", CAT_AMMO }, { "bolts", CAT_AMMO },
     { "weapons", CAT_WEAPON }, { "armour", CAT_ARMOUR }, { "armor", CAT_ARMOUR },
     { "containers", CAT_BACKPACK }, { "backpacks", CAT_BACKPACK }, { "blueprints", CAT_BLUEPRINT },
-    { "maps", CAT_MAP }, { "map", CAT_MAP }, { "medical", CAT_MEDICAL }, { "robotics", CAT_ROBOTICS }, { "food", CAT_FOOD },
+    { "maps", CAT_MAP }, { "map", CAT_MAP }, { "medical", CAT_MEDICAL }, { "robotics", CAT_ROBOTICS },
+    { "limbs", CAT_ROBOTICS }, { "robot limbs", CAT_ROBOTICS }, { "robotic limbs", CAT_ROBOTICS },
+    { "food", CAT_FOOD },
     { "building materials", CAT_BUILDMATS }, { "raw materials", CAT_RAWMATS },
     { "trade goods", CAT_TRADEGOODS }, { "items", CAT_OTHER },
 };
@@ -566,17 +618,11 @@ static Cat gameDataToCat(GameData* data, Cat hint)
 {
     if (hint != CAT_OTHER) return hint;
     if (!data) return CAT_OTHER;
-    switch (data->type)
-    {
-    case WEAPON: return CAT_WEAPON;
-    case CROSSBOW: return CAT_RANGED;
-    case ARMOUR: return CAT_ARMOUR;
-    case CONTAINER: return CAT_BACKPACK;
-    case BLUEPRINT: return CAT_BLUEPRINT;
-    case ARTIFACTS: return CAT_ARTIFACTS;
-    case MAP_ITEM: return CAT_MAP;
-    default: break;
-    }
+    Cat typeCat = gameDataTypeToCat(data->type);
+    if (typeCat != CAT_OTHER) return typeCat;
+
+    Cat refCat = referenceCategoryForItemID(toLower(data->stringID));
+    if (refCat != CAT_OTHER) return refCat;
 
     std::string name = toLower(data->name + " " + data->stringID);
     Cat c;
@@ -596,6 +642,7 @@ static bool gameDataTypeCanBeShopStock(itemType t)
     case BLUEPRINT:
     case ARTIFACTS:
     case MAP_ITEM:
+    case LIMB_REPLACEMENT:
         return true;
     default:
         return false;
@@ -658,6 +705,9 @@ static void addStockGameData(GameData* vendor, GameData* itemData, Cat hint,
     }
     if (c != CAT_OTHER) ctx.stockCats.insert(c);
 
+    std::string id = toLower(itemData->stringID);
+    if (!id.empty()) ctx.stockIds.insert(id);
+
     std::string nm = normaliseName(itemData->name);
     if (!nm.empty()) ctx.stockNames.insert(nm);
     ctx.haveStock = true;
@@ -673,12 +723,9 @@ typedef boost::unordered::unordered_map<
         std::pair<std::string const, Ogre::vector<GameDataReference>::type>,
         Ogre::GeneralAllocPolicy> > GameDataReferenceMap;
 
-static std::set<std::string> gGeneralTradeAllowNames;
-static bool gGeneralTradeAllowListLoaded = false;
-
-// Adds exact item names from a vendor list; FCS stores many trade goods as
-// generic ITEM data, so category alone is not enough for this allow-list.
-static void addGeneralTradeAllowedItemsFrom(GameData* vendor)
+// Adds exact item IDs from a vendor list. FCS stores many useful goods as
+// generic ITEM data, so curated lists are more stable than display names.
+static void addReferenceListItemsToSet(GameData* vendor, std::set<std::string>& out)
 {
     if (!vendor) return;
     for (GameDataReferenceMap::const_iterator it = vendor->objectReferences.begin();
@@ -690,65 +737,108 @@ static void addGeneralTradeAllowedItemsFrom(GameData* vendor)
         {
             GameData* itemData = refs[i].ptr;
             if (!itemData || !gameDataTypeCanBeShopStock(itemData->type)) continue;
-            std::string nm = normaliseName(itemData->name);
-            if (!nm.empty()) gGeneralTradeAllowNames.insert(nm);
+            std::string id = toLower(itemData->stringID);
+            if (!id.empty()) out.insert(id);
         }
     }
 }
 
-// Loads the mod-owned force-allow list plus vanilla trade-good lists once.
-static void loadGeneralTradeAllowList()
+static void loadReferenceList(GameDataContainer& gamedata, const char* id,
+                              std::set<std::string>& out, const char* label)
 {
-    if (gGeneralTradeAllowListLoaded) return;
-    gGeneralTradeAllowListLoaded = true;
-
-    if (!ou)
+    GameData* vendor = gamedata.getData(std::string(id), VENDOR_LIST);
+    if (!vendor)
     {
-        if (cfg::debug) DebugLog("[TRII][trade_allow] GameWorld unavailable; force-allow items not loaded");
+        if (cfg::debug)
+        {
+            char miss[192];
+            _snprintf_s(miss, sizeof(miss), _TRUNCATE,
+                "[TRII][ref_list] vendor list not found label=%s id=%s", label, id);
+            DebugLog(miss);
+        }
         return;
     }
 
-    static const char* const allowListIds[] = {
-        "10-Traders Refuse Irrelevant Items.mod", // mod-owned general-trader force-allow list
-        "1013-gamedata.base", // all trade goods
-        "1386-gamedata.base"  // trade goods
-    };
-
-    for (size_t i = 0; i < sizeof(allowListIds) / sizeof(allowListIds[0]); ++i)
-    {
-        GameData* vendor = ou->gamedata.getData(std::string(allowListIds[i]), VENDOR_LIST);
-        if (!vendor)
-        {
-            if (cfg::debug)
-            {
-                char miss[192];
-                _snprintf_s(miss, sizeof(miss), _TRUNCATE,
-                    "[TRII][trade_allow] vendor list not found id=%s", allowListIds[i]);
-                DebugLog(miss);
-            }
-            continue;
-        }
-        addGeneralTradeAllowedItemsFrom(vendor);
-    }
-
+    addReferenceListItemsToSet(vendor, out);
     if (cfg::debug)
     {
         char buf[192];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "[TRII][trade_allow] listsLoaded=%d items=%d",
-            gGeneralTradeAllowNames.empty() ? 0 : 1,
-            (int)gGeneralTradeAllowNames.size());
+            "[TRII][ref_list] loaded label=%s id=%s items=%d",
+            label, id, (int)out.size());
         DebugLog(buf);
     }
 }
 
-static bool isGeneralTradeAllowName(const std::string& normalisedName)
+// Loads curated FCS reference lists once. These lists give generic ITEM records
+// stable category/allowance meaning without matching localized display names.
+static void loadReferenceLists()
 {
-    loadGeneralTradeAllowList();
-    return gGeneralTradeAllowNames.find(normalisedName) != gGeneralTradeAllowNames.end();
+    if (gReferenceListsLoaded) return;
+
+    if (!ou)
+    {
+        if (cfg::debug) DebugLog("[TRII][ref_list] GameWorld unavailable; reference lists not loaded");
+        return;
+    }
+    gReferenceListsLoaded = true;
+
+    loadReferenceList(ou->gamedata, "11-Traders Refuse Irrelevant Items.mod",
+        gGeneralTradeAllowIds, "force accept general store");
+    loadReferenceList(ou->gamedata, "1013-gamedata.base",
+        gGeneralTradeAllowIds, "all trade goods");
+    loadReferenceList(ou->gamedata, "1386-gamedata.base",
+        gGeneralTradeAllowIds, "trade goods");
+
+    loadReferenceList(ou->gamedata, "43969-rebirth.mod",
+        gFoodIds, "all food");
+    loadReferenceList(ou->gamedata, "12-Traders Refuse Irrelevant Items.mod",
+        gDrinkWaterIds, "drink and water");
+    loadReferenceList(ou->gamedata, "13-Traders Refuse Irrelevant Items.mod",
+        gBookIds, "books");
+    loadReferenceList(ou->gamedata, "56360-rebirth.mod",
+        gUsefulBuildingMatIds, "useful building mats");
+    loadReferenceList(ou->gamedata, "14-Traders Refuse Irrelevant Items.mod",
+        gCrossbowForceIds, "crossbow force");
+    loadReferenceList(ou->gamedata, "15-Traders Refuse Irrelevant Items.mod",
+        gArmorForceIds, "armor force");
+
+    if (cfg::debug)
+    {
+        char buf[384];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "[TRII][ref_list] totals trade=%d food=%d drinkWater=%d books=%d building=%d crossbow=%d armor=%d",
+            (int)gGeneralTradeAllowIds.size(), (int)gFoodIds.size(),
+            (int)gDrinkWaterIds.size(), (int)gBookIds.size(),
+            (int)gUsefulBuildingMatIds.size(), (int)gCrossbowForceIds.size(),
+            (int)gArmorForceIds.size());
+        DebugLog(buf);
+    }
 }
 
-// Scan the shop's live inventory into a category + normalized-name profile.
+static bool isGeneralTradeAllowID(const std::string& itemId)
+{
+    loadReferenceLists();
+    return gGeneralTradeAllowIds.find(itemId) != gGeneralTradeAllowIds.end();
+}
+
+static bool setHasItemID(const std::set<std::string>& ids, const std::string& itemId)
+{
+    return !itemId.empty() && ids.find(itemId) != ids.end();
+}
+
+static Cat referenceCategoryForItemID(const std::string& itemId)
+{
+    if (itemId.empty()) return CAT_OTHER;
+    loadReferenceLists();
+    if (setHasItemID(gFoodIds, itemId)) return CAT_FOOD;
+    if (setHasItemID(gDrinkWaterIds, itemId)) return CAT_BOOZE;
+    if (setHasItemID(gBookIds, itemId)) return CAT_BOOK;
+    if (setHasItemID(gUsefulBuildingMatIds, itemId)) return CAT_BUILDMATS;
+    return CAT_OTHER;
+}
+
+// Scan the shop's live inventory into a category + stock-ID profile.
 static void buildStockProfile(Inventory* inv, ShopContext& ctx)
 {
     if (!inv) return;
@@ -762,6 +852,8 @@ static void buildStockProfile(Inventory* inv, ShopContext& ctx)
         Item* it = items[i];
         if (!it) continue;
         ctx.stockCats.insert(classifyItem(it));
+        std::string id = itemStringID(it);
+        if (!id.empty()) ctx.stockIds.insert(id);
         std::string nm = normaliseName(safeName(it));
         if (!nm.empty()) ctx.stockNames.insert(nm);
     }
@@ -785,7 +877,9 @@ static void addVendorTemplateRefs(GameData* vendor, ShopContext& ctx)
         for (GameDataReferenceMap::const_iterator it = vendor->objectReferences.begin();
              it != vendor->objectReferences.end(); ++it)
         {
-            Cat hint = vendorRefListHint(it->first);
+            Cat hint = referenceListCategoryHint(vendor);
+            if (hint == CAT_OTHER)
+                hint = vendorRefListHint(it->first);
             if (generalTradeList && hint == CAT_OTHER)
                 hint = CAT_TRADEGOODS;
             const Ogre::vector<GameDataReference>::type& refs = it->second;
@@ -903,6 +997,11 @@ static void logNoVendorListFound(RootObject* shop)
 
 static void deriveShopTraits(ShopContext& ctx)
 {
+    std::string shopName = readable(ctx.shop, 8) ? normaliseName(safeName(ctx.shop)) : std::string();
+    ctx.isThiefFence = shopName == "thief fence";
+    ctx.isAcceptAllVendor = ctx.isThiefFence || shopName == "shinobi trader";
+    ctx.isSkeletonVendor = isCharacterType(ctx.shop) && characterIsSkeleton((Character*)ctx.shop);
+    ctx.sellsFood = ctx.stockCats.count(CAT_FOOD) > 0;
     ctx.sellsRobotics = stockLooksLikeRobotics(ctx);
     ctx.isWeaponsOnlyShop = stockHasOnlyWeaponGoods(ctx.stockCats);
     ctx.sellsArmorOrClothing = ctx.stockCats.count(CAT_ARMOUR) > 0 || ctx.archetype == "armoursmith";
@@ -938,13 +1037,14 @@ static void ensureContext(RootObject* shop, Inventory* stockInv)
         std::string stockNames = stockNameSummary(gCtx.stockNames);
         char buf[1280];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "[TRII][shop] name=%s archetype=%s foundVendorList=%d haveStock=%d stockCats=%d stockCatList=%s stockNames=%d stockNameSample=%s vendorLists=%d vendorListNames=%s tradeAllowList=%d tradeShop=%d robotics=%d weaponOnly=%d armour=%d bar=%d liveItems=%d templateRefs=%d",
+            "[TRII][shop] name=%s archetype=%s foundVendorList=%d haveStock=%d stockCats=%d stockCatList=%s stockIds=%d stockNames=%d stockNameSample=%s vendorLists=%d vendorListNames=%s tradeAllowList=%d tradeShop=%d robotics=%d weaponOnly=%d armour=%d bar=%d thiefFence=%d acceptAll=%d skeletonVendor=%d sellsFood=%d liveItems=%d templateRefs=%d",
             safeName(shop).c_str(), gCtx.archetype.c_str(), (int)gCtx.foundVendorList, (int)gCtx.haveStock,
-            (int)gCtx.stockCats.size(), cats.c_str(), (int)gCtx.stockNames.size(),
+            (int)gCtx.stockCats.size(), cats.c_str(), (int)gCtx.stockIds.size(), (int)gCtx.stockNames.size(),
             stockNames.c_str(), (int)gCtx.vendorListNames.size(), vendorLists.c_str(),
             (int)gCtx.hasGeneralTradeAllowList, (int)gCtx.isTradeShop, (int)gCtx.sellsRobotics,
             (int)gCtx.isWeaponsOnlyShop, (int)gCtx.sellsArmorOrClothing, (int)gCtx.isBar,
-            gCtx.liveStockItems, gCtx.templateStockRefs);
+            (int)gCtx.isThiefFence, (int)gCtx.isAcceptAllVendor, (int)gCtx.isSkeletonVendor,
+            (int)gCtx.sellsFood, gCtx.liveStockItems, gCtx.templateStockRefs);
         DebugLog(buf);
     }
 }
@@ -973,30 +1073,40 @@ static Disp baseDisposition(const Rule& rule, Cat cat, double* reducedMult)
     return DISP_REFUSE;
 }
 
-// Some shop stock categories imply closely-related goods. Crossbow shops may
-// expose only their weapons as stock, but bolts are still relevant to them.
-static bool stockAcceptsRelated(Cat cat)
+static bool itemIsFoodForSale(Cat cat, const std::string& itemId)
 {
-    if (cat == CAT_AMMO && gCtx.stockCats.count(CAT_RANGED)) return true;
-    return false;
+    if (cat == CAT_FOOD) return true;
+    return referenceCategoryForItemID(itemId) == CAT_FOOD;
 }
 
 // The shop's real stock expands acceptance; otherwise fall back to the rule.
-static Disp dispositionFor(Cat cat, const std::string& itemName, double* reducedMult)
+static Disp dispositionFor(Cat cat, const std::string& itemId, double* reducedMult)
 {
+    if (gCtx.isSkeletonVendor && !gCtx.sellsFood && itemIsFoodForSale(cat, itemId))
+        return DISP_REFUSE;
+    if (gCtx.isAcceptAllVendor) return DISP_FULL;
+
     const Rule& rule = ruleFor(gCtx.archetype);
     if (cfg::useStockAcceptance && gCtx.haveStock)
     {
-        if (cat != CAT_OTHER && (gCtx.stockCats.count(cat) || stockAcceptsRelated(cat))) return DISP_FULL;
-        std::string nn = normaliseName(itemName);
-        if (!nn.empty() && gCtx.stockNames.count(nn)) return DISP_FULL;
-        if (isShopSpecificAcceptedGood(itemName, cat)) return DISP_FULL;
+        if (!itemId.empty() && gCtx.stockIds.count(itemId)) return DISP_FULL;
+        if (isShopSpecificAcceptedGood(itemId, cat)) return DISP_FULL;
+        if (cfg::strictVendorStockAcceptance)
+        {
+            if (itemIsFoodForSale(cat, itemId))
+            {
+                if (reducedMult) *reducedMult = cfg::offListFoodMult;
+                return DISP_REDUCED;
+            }
+            return DISP_REFUSE;
+        }
+        if (cat != CAT_OTHER && gCtx.stockCats.count(cat)) return DISP_FULL;
         if (cat == CAT_FOOD)
         {
             if (reducedMult) *reducedMult = cfg::offListFoodMult;
             return DISP_REDUCED;
         }
-        // stock is known and the item matched neither category nor name:
+        // stock is known and the item matched neither category nor ID:
         // still honour a reduced rule (e.g. food), else refuse.
         std::map<Cat, double>::const_iterator it = rule.reduced.find(cat);
         if (it != rule.reduced.end()) { if (reducedMult) *reducedMult = it->second; return DISP_REDUCED; }
@@ -1004,6 +1114,8 @@ static Disp dispositionFor(Cat cat, const std::string& itemName, double* reduced
         // through just because the classifier could not name their category.
         return DISP_REFUSE;
     }
+    if (cfg::useStockAcceptance && cfg::strictVendorStockAcceptance && gCtx.foundVendorList)
+        return DISP_REFUSE;
     if (cfg::useStockAcceptance && cfg::acceptAllWhenNoVendorList && !gCtx.foundVendorList)
         return DISP_FULL;
     return baseDisposition(rule, cat, reducedMult);
@@ -1080,6 +1192,21 @@ static bool readable(const void* p, size_t n)
     return ((uintptr_t)p + n) <= regionEnd;
 }
 
+static GameData* itemGameData(InventoryItemBase* item)
+{
+    if (!readable(item, 8)) return NULL;
+    GameData* data = item->getGameData();
+    if (!readable(data, 8)) return NULL;
+    return data;
+}
+
+static std::string itemStringID(InventoryItemBase* item)
+{
+    GameData* data = itemGameData(item);
+    if (!data) return std::string();
+    return toLower(data->stringID);
+}
+
 typedef int (*GetValueSingle_t)(InventoryItemBase*, bool);
 static GetValueSingle_t GetValueSingle_orig = NULL;
 
@@ -1118,17 +1245,19 @@ static void logValueDecision(InventoryItemBase* item, Cat cat, Disp disp,
     if (gSeenValueProfiles.size() >= 80) return;
     std::string section = item ? item->inventorySection : std::string();
     std::string itemName = item ? safeName((RootObject*)item) : std::string();
+    std::string itemId = itemStringID(item);
     std::string key = gCtx.archetype + "|" + catLabel(cat) + "|" +
-        dispLabel(disp) + "|" + section + "|" + itemName;
+        dispLabel(disp) + "|" + section + "|" + itemId + "|" + itemName;
     if (gSeenValueProfiles.find(key) != gSeenValueProfiles.end()) return;
     gSeenValueProfiles.insert(key);
 
     char buf[384];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-        "[TRII][item] shop=%s archetype=%s item=%s section=%s fn=%d cat=%s disp=%s base=%d avg=%d ret=%d traderMult=%.3f stockCats=%d stockNames=%d",
-        safeName(gCtx.shop).c_str(), gCtx.archetype.c_str(), itemName.c_str(), section.c_str(),
+        "[TRII][item] shop=%s archetype=%s item=%s itemId=%s section=%s fn=%d cat=%s disp=%s base=%d avg=%d ret=%d traderMult=%.3f stockCats=%d stockIds=%d stockNames=%d",
+        safeName(gCtx.shop).c_str(), gCtx.archetype.c_str(), itemName.c_str(), itemId.c_str(), section.c_str(),
         item ? (int)item->itemFunction : -1, catLabel(cat), dispLabel(disp),
-        base, avg, returned, traderMult, (int)gCtx.stockCats.size(), (int)gCtx.stockNames.size());
+        base, avg, returned, traderMult, (int)gCtx.stockCats.size(),
+        (int)gCtx.stockIds.size(), (int)gCtx.stockNames.size());
     DebugLog(buf);
 }
 
@@ -1154,8 +1283,14 @@ static int GetValueSingle_impl(InventoryItemBase* self, bool isPlayer, int base)
 
     Cat cat = classifyByFunctionAndSection(self);
     double mult = 1.0;
-    Disp disp = dispositionFor(cat, safeName((RootObject*)self), &mult);
+    Disp disp = dispositionFor(cat, itemStringID(self), &mult);
     float traderMult = safeTraderPriceMultiplier();
+
+    if (gCtx.isAcceptAllVendor && disp == DISP_FULL)
+    {
+        logValueDecision(self, cat, disp, base, -1, base, traderMult);
+        return base;
+    }
 
     if (disp == DISP_REFUSE)
     {
@@ -1532,7 +1667,7 @@ static bool analysePlayerSaleToShop(Inventory* destInv, Item* item, int quantity
     if (readable(shop, 8) && readable(item, 8))
     {
         ensureContext(shop, destInv);
-        disp = dispositionFor(cat, safeName(item), NULL);
+        disp = dispositionFor(cat, itemStringID(item), NULL);
     }
     if (catOut) *catOut = cat;
     if (dispOut) *dispOut = disp;
@@ -1540,7 +1675,7 @@ static bool analysePlayerSaleToShop(Inventory* destInv, Item* item, int quantity
     return quantity > 0 && destIsShop && sourceIsPlayer;
 }
 
-static void refusalFeedbackGuarded(Character* speaker);
+static void refusalFeedbackGuarded(Character* speaker, Item* item);
 
 // ---------------------------------------------------------------------
 //  Inventory::addItem refusal
@@ -1682,7 +1817,7 @@ static bool InventoryAddItem_hook(Inventory* self, Item* itemToAdd, int quantity
         Character* speaker = NULL;
         if (shouldRefuseAddItemGuarded(self, itemToAdd, quantity, &speaker))
         {
-            refusalFeedbackGuarded(speaker);
+            refusalFeedbackGuarded(speaker, itemToAdd);
             return false;
         }
     }
@@ -1774,7 +1909,7 @@ static bool InventoryTransferMouseItem_hook(Inventory* self, Item* item)
         {
             if (cfg::debug)
                 DebugLog("[TRII][transfer_refuse] blocked refused drag/drop sale");
-            refusalFeedbackGuarded(speaker);
+            refusalFeedbackGuarded(speaker, item);
             return false;
         }
     }
@@ -1929,7 +2064,7 @@ static void InventorySectionPlaceItem_hook(InventorySection* self, Item* item, i
         {
             logSectionPlaceProbeGuarded("refuse", self, item, x, y, true);
             restoreRefusedItemToPlayerGuarded(item, quantity);
-            refusalFeedbackGuarded(speaker);
+            refusalFeedbackGuarded(speaker, item);
             return;
         }
     }
@@ -1960,7 +2095,7 @@ static bool ShopTraderInventoryAddItemInternal_hook(ShopTraderInventory* self, I
         Character* speaker = NULL;
         if (shouldRefuseAddItemGuarded(self, itemToAdd, quantity, &speaker))
         {
-            refusalFeedbackGuarded(speaker);
+            refusalFeedbackGuarded(speaker, itemToAdd);
             return false;
         }
     }
@@ -1998,7 +2133,7 @@ static bool ShopTraderInventorySectionAddItem_hook(ShopTraderInventorySection* s
         Character* speaker = NULL;
         if (shouldRefuseAddItemGuarded(inv, itemToAdd, quantity, &speaker))
         {
-            refusalFeedbackGuarded(speaker);
+            refusalFeedbackGuarded(speaker, itemToAdd);
             return false;
         }
     }
@@ -2020,6 +2155,13 @@ static bool ShopTraderInventorySectionAddItem_hook(ShopTraderInventorySection* s
 static bool refusalModeIs(const char* mode)
 {
     return std::string(cfg::refusalMode) == mode;
+}
+
+static const char* kSuicideNoteItemId = "49494-dialogue.mod";
+
+static bool itemIsSuicideNote(Item* item)
+{
+    return itemStringID(item) == kSuicideNoteItemId;
 }
 
 static std::map<Character*, int> gRefusalSpeechCounts;
@@ -2056,6 +2198,16 @@ static const char* raceRefusalLineForCount(RaceGroup speakerRace, RaceGroup targ
         default: return "Still no, flatskin.";
         }
     }
+    if (speakerRace == RACE_SHEK && targetRace == RACE_HIVER)
+    {
+        switch (count)
+        {
+        case 0: return "Bring me something better, insect-man.";
+        case 1: return "Your items are worthless, bug.";
+        case 2: return "Try a scrapyard, bug.";
+        default: return "I have no interest in your toys, insect-man.";
+        }
+    }
     if (speakerRace == RACE_HUMAN && targetRace == RACE_SHEK)
     {
         switch (count)
@@ -2080,16 +2232,57 @@ static const char* raceRefusalLineForCount(RaceGroup speakerRace, RaceGroup targ
     {
         switch (count)
         {
-        case 0: return "Rejected. Merchant criteria not met.";
-        case 1: return "Repeated rejection acknowledged.";
-        case 2: return "Please select a compatible item.";
-        default: return "Still incompatible.";
+        case 0: return "Not interested.";
+        case 1: return "This item is not valuable to me.";
+        case 2: return "I do not want this.";
+        default: return "No.";
         }
     }
     return genericRefusalLineForCount(count);
 }
 
-static void speakRefusal(Character* speaker)
+static const char* suicideNoteRefusalLineForRace(RaceGroup speakerRace, int count)
+{
+    if (speakerRace == RACE_HUMAN)
+    {
+        switch (count)
+        {
+        case 0: return "I'm not buying someone's last words.";
+        case 1: return "That belongs with the dead.";
+        default: return "Put it away.";
+        }
+    }
+    if (speakerRace == RACE_SHEK)
+    {
+        switch (count)
+        {
+        case 0: return "A coward's last writings does not interest me.";
+        case 1: return "This paper is worthless to me.";
+        default: return "...";
+        }
+    }
+    if (speakerRace == RACE_HIVER)
+    {
+        switch (count)
+        {
+        case 0: return "No trade for death-note, no no.";
+        case 1: return "Shop cannot buy this cursed thing.";
+        default: return "Still no trade.";
+        }
+    }
+    if (speakerRace == RACE_SKELETON)
+    {
+        switch (count)
+        {
+        case 0: return "Please put that away.";
+        case 1: return "I will not buy this.";
+        default: return "Absolutely not.";
+        }
+    }
+    return "No. Some things aren't merchandise.";
+}
+
+static void speakRefusal(Character* speaker, Item* item)
 {
     if (!speaker) return;
     if (refusalModeIs("silent")) return;
@@ -2118,7 +2311,10 @@ static void speakRefusal(Character* speaker)
     gRefusalSpeechLastMs[speaker] = now;
 
     int count = gRefusalSpeechCounts[speaker]++;
-    const char* line = raceRefusalLineForCount(speakerRace, targetRace, count);
+    bool suicideNote = readable(item, 8) && itemIsSuicideNote(item);
+    const char* line = suicideNote ?
+        suicideNoteRefusalLineForRace(speakerRace, count) :
+        raceRefusalLineForCount(speakerRace, targetRace, count);
     speaker->sayALine(std::string(line), true);
     if (cfg::debug)
     {
@@ -2126,9 +2322,9 @@ static void speakRefusal(Character* speaker)
         std::string targetRaceData = raceDataSummary(target);
         char buf[960];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "[TRII][refusal_speech] speaker=%s target=%s speakerRace=%s targetRace=%s count=%d line=%s speakerData={%s} targetData={%s}",
+            "[TRII][refusal_speech] speaker=%s target=%s speakerRace=%s targetRace=%s count=%d suicideNote=%d line=%s speakerData={%s} targetData={%s}",
             objectSummary((RootObject*)speaker).c_str(), objectSummary((RootObject*)target).c_str(),
-            raceGroupLabel(speakerRace), raceGroupLabel(targetRace), count, line,
+            raceGroupLabel(speakerRace), raceGroupLabel(targetRace), count, (int)suicideNote, line,
             speakerRaceData.c_str(), targetRaceData.c_str());
         DebugLog(buf);
     }
@@ -2281,11 +2477,11 @@ void _showTradeWindow_hook(ForgottenGUI* thisptr, RootObject* a, RootObject* b, 
     logTradeWindowOpen("post", thisptr, a, b, tradeType);
 }
 
-static void refusalFeedbackGuarded(Character* speaker)
+static void refusalFeedbackGuarded(Character* speaker, Item* item)
 {
     __try
     {
-        speakRefusal(speaker);
+        speakRefusal(speaker, item);
         closeTradeWindowForRefusal();
     }
     __except (triiSehFilter("block.feedback", GetExceptionInformation()))
@@ -2371,7 +2567,7 @@ static bool PlaceItemFromMouse_hook(InventoryGUI* self, const std::string& secti
         {
             if (cfg::debug)
                 DebugLog("[TRII][mouse_place_refuse] blocked refused drag/drop sale");
-            refusalFeedbackGuarded(speaker);
+            refusalFeedbackGuarded(speaker, readable(self, 8) ? IGUIHookAccess::mouseItemFor(self) : NULL);
             return false;
         }
     }
