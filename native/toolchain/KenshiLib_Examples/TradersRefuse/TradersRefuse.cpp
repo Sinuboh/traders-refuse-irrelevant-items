@@ -82,6 +82,11 @@ namespace cfg
     static const double offListFoodMult     = 0.6;    // most shops will still buy food, just at a worse price
     static const bool   logVendorListItems  = true;   // dump exact FCS vendor-list stock refs once per run
     static const int    maxVendorItemLogs   = 240;    // enough to learn shops, bounded to avoid log floods
+    static const uint32_t maxStockScan      = 4096;   // per-category cap when folding vendor/live stock into the shop
+                                                      // profile. The old 80-120 caps truncated large pools - e.g. the
+                                                      // Great Library's research "items" list - so off-list research
+                                                      // artifacts past the cap were never added to stockIds and got
+                                                      // refused. 4096 is a defensive ceiling well above any real list.
     static const bool   requireMoneyTrade   = true;   // only act inside real money trades
     static const bool   treatOwnerlessTradeItemsAsPlayerSales = true; // catches equipped/spawned items with null owners
 
@@ -360,13 +365,14 @@ struct ShopContext
     bool           isAcceptAllVendor;
     bool           isSkeletonVendor;
     bool           sellsFood;
+    bool           sellsBlueprints;
     int            liveStockItems;
     int            templateStockRefs;
 
     ShopContext() : shop(NULL), archetype("_default"), foundVendorList(false), haveStock(false),
         hasGeneralTradeAllowList(false), isTradeShop(false), sellsRobotics(false),
         isWeaponsOnlyShop(false), sellsArmorOrClothing(false), isBar(false), isThiefFence(false),
-        isAcceptAllVendor(false), isSkeletonVendor(false), sellsFood(false),
+        isAcceptAllVendor(false), isSkeletonVendor(false), sellsFood(false), sellsBlueprints(false),
         liveStockItems(0), templateStockRefs(0) {}
     void clear()
     {
@@ -374,7 +380,7 @@ struct ShopContext
         stockCats.clear(); stockIds.clear(); stockNames.clear(); seenVendorLists.clear(); vendorListNames.clear();
         hasGeneralTradeAllowList = false; isTradeShop = false; sellsRobotics = false;
         isWeaponsOnlyShop = false; sellsArmorOrClothing = false; isBar = false; isThiefFence = false;
-        isAcceptAllVendor = false; isSkeletonVendor = false; sellsFood = false;
+        isAcceptAllVendor = false; isSkeletonVendor = false; sellsFood = false; sellsBlueprints = false;
         liveStockItems = 0; templateStockRefs = 0;
     }
 };
@@ -575,6 +581,13 @@ static bool isShopSpecificAcceptedGood(const std::string& itemId, Cat cat)
     if (gCtx.isBar &&
         (cat == CAT_FOOD || cat == CAT_BOOZE || cat == CAT_WATER))
         return true;
+    // Blueprint sellers reference the produced item, not the blueprint object,
+    // so the sold blueprint's ID never matches stockIds - accept by category.
+    if (gCtx.sellsBlueprints && cat == CAT_BLUEPRINT)
+        return true;
+    // A shop that stocks books buys any book (symmetric to bars/food).
+    if (cat == CAT_BOOK && gCtx.stockCats.count(CAT_BOOK) > 0)
+        return true;
     if (itemId.empty()) return false;
 
     loadReferenceLists();
@@ -731,7 +744,7 @@ static void addReferenceListItemsToSet(GameData* vendor, std::set<std::string>& 
          it != vendor->objectReferences.end(); ++it)
     {
         const Ogre::vector<GameDataReference>::type& refs = it->second;
-        uint32_t scanned = refs.size() < 240 ? (uint32_t)refs.size() : 240;
+        uint32_t scanned = refs.size() < cfg::maxStockScan ? (uint32_t)refs.size() : cfg::maxStockScan;
         for (uint32_t i = 0; i < scanned; ++i)
         {
             GameData* itemData = refs[i].ptr;
@@ -845,7 +858,7 @@ static void buildStockProfile(Inventory* inv, ShopContext& ctx)
     uint32_t n = items.size();
     if (n == 0) return;
     ctx.liveStockItems += (int)n;
-    uint32_t scanned = n < 120 ? n : 120;
+    uint32_t scanned = n < cfg::maxStockScan ? n : cfg::maxStockScan;
     for (uint32_t i = 0; i < scanned; ++i)
     {
         Item* it = items[i];
@@ -857,6 +870,16 @@ static void buildStockProfile(Inventory* inv, ShopContext& ctx)
         if (!nm.empty()) ctx.stockNames.insert(nm);
     }
     ctx.haveStock = !ctx.stockCats.empty();
+}
+
+// FCS blueprint vendor lists (keys like "armour blueprints", "crossbow
+// blueprints", "BLUEPRINT_ITEM_ARMOUR") reference the *produced* item data
+// (ARMOUR/WEAPON), never the BLUEPRINT-typed object the player later sells, so
+// those blueprint stringIDs never enter stockIds. Flagging the shop as a
+// blueprint seller off the list KEY lets us accept blueprint sales by category.
+static bool keyLooksLikeBlueprintList(const std::string& key)
+{
+    return toLower(key).find("blueprint") != std::string::npos;
 }
 
 static void addVendorTemplateRefs(GameData* vendor, ShopContext& ctx)
@@ -875,13 +898,14 @@ static void addVendorTemplateRefs(GameData* vendor, ShopContext& ctx)
         for (GameDataReferenceMap::const_iterator it = vendor->objectReferences.begin();
              it != vendor->objectReferences.end(); ++it)
         {
+            if (keyLooksLikeBlueprintList(it->first)) ctx.sellsBlueprints = true;
             Cat hint = referenceListCategoryHint(vendor);
             if (hint == CAT_OTHER)
                 hint = vendorRefListHint(it->first);
             if (generalTradeList && hint == CAT_OTHER)
                 hint = CAT_TRADEGOODS;
             const Ogre::vector<GameDataReference>::type& refs = it->second;
-            uint32_t scanned = refs.size() < 120 ? (uint32_t)refs.size() : 120;
+            uint32_t scanned = refs.size() < cfg::maxStockScan ? (uint32_t)refs.size() : cfg::maxStockScan;
             for (uint32_t j = 0; j < scanned; ++j)
                 addStockGameData(vendor, refs[j].ptr, hint, it->first, (int)j, ctx);
         }
@@ -893,11 +917,12 @@ static void addVendorTemplateRefs(GameData* vendor, ShopContext& ctx)
             const Ogre::vector<GameDataReference>::type* refs =
                 vendor->getReferenceListIfExists(kVendorStockLists[i].name);
             if (!refs || refs->empty()) continue;
+            if (keyLooksLikeBlueprintList(kVendorStockLists[i].name)) ctx.sellsBlueprints = true;
             Cat hint = kVendorStockLists[i].cat;
             if (ctx.hasGeneralTradeAllowList && hint == CAT_OTHER)
                 hint = CAT_TRADEGOODS;
             if (hint != CAT_OTHER) ctx.stockCats.insert(hint);
-            uint32_t scanned = refs->size() < 80 ? (uint32_t)refs->size() : 80;
+            uint32_t scanned = refs->size() < cfg::maxStockScan ? (uint32_t)refs->size() : cfg::maxStockScan;
             for (uint32_t j = 0; j < scanned; ++j)
                 addStockGameData(vendor, (*refs)[j].ptr, hint, kVendorStockLists[i].name, (int)j, ctx);
         }
@@ -1037,14 +1062,14 @@ static void ensureContext(RootObject* shop, Inventory* stockInv)
         std::string stockNames = stockNameSummary(gCtx.stockNames);
         char buf[1280];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "[TRII][shop] name=%s archetype=%s foundVendorList=%d haveStock=%d stockCats=%d stockCatList=%s stockIds=%d stockNames=%d stockNameSample=%s vendorLists=%d vendorListNames=%s tradeAllowList=%d tradeShop=%d robotics=%d weaponOnly=%d armour=%d bar=%d thiefFence=%d acceptAll=%d skeletonVendor=%d sellsFood=%d liveItems=%d templateRefs=%d",
+            "[TRII][shop] name=%s archetype=%s foundVendorList=%d haveStock=%d stockCats=%d stockCatList=%s stockIds=%d stockNames=%d stockNameSample=%s vendorLists=%d vendorListNames=%s tradeAllowList=%d tradeShop=%d robotics=%d weaponOnly=%d armour=%d bar=%d thiefFence=%d acceptAll=%d skeletonVendor=%d sellsFood=%d sellsBlueprints=%d liveItems=%d templateRefs=%d",
             safeName(shop).c_str(), gCtx.archetype.c_str(), (int)gCtx.foundVendorList, (int)gCtx.haveStock,
             (int)gCtx.stockCats.size(), cats.c_str(), (int)gCtx.stockIds.size(), (int)gCtx.stockNames.size(),
             stockNames.c_str(), (int)gCtx.vendorListNames.size(), vendorLists.c_str(),
             (int)gCtx.hasGeneralTradeAllowList, (int)gCtx.isTradeShop, (int)gCtx.sellsRobotics,
             (int)gCtx.isWeaponsOnlyShop, (int)gCtx.sellsArmorOrClothing, (int)gCtx.isBar,
             (int)gCtx.isThiefFence, (int)gCtx.isAcceptAllVendor, (int)gCtx.isSkeletonVendor,
-            (int)gCtx.sellsFood, gCtx.liveStockItems, gCtx.templateStockRefs);
+            (int)gCtx.sellsFood, (int)gCtx.sellsBlueprints, gCtx.liveStockItems, gCtx.templateStockRefs);
         DebugLog(buf);
     }
 }
@@ -1127,6 +1152,8 @@ static Disp dispositionFor(Cat cat, const std::string& itemId, double* reducedMu
 //  safe default, instead of crashing Kenshi. This filter records the fault
 //  site, exception code and address ONCE per site (so it can't spam a
 //  per-frame hook), then runs the __except body (which returns the default).
+//  Caveat: C++ locals in the faulting *_impl frame are not unwound on this path
+//  (SEH runs no C++ destructors) - a bounded leak, since each site logs once.
 // ---------------------------------------------------------------------
 static std::set<std::string> gSeenFaults;
 
@@ -1946,10 +1973,9 @@ static bool InventoryTransferMouseItem_hook(Inventory* self, Item* item)
     return ret;
 }
 
-// InventorySection::_addItem can be reached after the mouse already picked up
-// the item. Returning early blocks the shop placement, but without this restore
-// the item can vanish from the visible player inventory until the engine catches
-// up, so refused drag/drop sales are explicitly handed back.
+// Section placement fires after the mouse picked the item up, so a refused sale
+// must be handed back or it vanishes from the player inventory until the engine
+// catches up.
 static bool restoreRefusedItemToPlayerImpl(Item* item, int quantity)
 {
     if (!cfg::restoreRefusedDragDropItems) return false;
@@ -1988,11 +2014,11 @@ static bool restoreRefusedItemToPlayerImpl(Item* item, int quantity)
     if (sameTradeObject(currentOwner, gTrade.player))
         return true;
 
-    bool ret = false;
-    if (InventoryAddItem_orig)
-        ret = InventoryAddItem_orig(playerInv, item, quantity > 0 ? quantity : 1, false, false);
-    else
-        ret = playerInv->addItem(item, quantity > 0 ? quantity : 1, false, false);
+    // Route through the captured original, never the public addItem - the latter
+    // re-enters our Inventory::_addItem hook. A null original means the hook never
+    // installed, so there is nothing safe to hand the item back through.
+    if (!InventoryAddItem_orig) return false;
+    bool ret = InventoryAddItem_orig(playerInv, item, quantity > 0 ? quantity : 1, false, false);
 
     if (ret)
         gTrade.playerItems.insert(item);
@@ -2195,16 +2221,10 @@ static bool ShopTraderInventorySectionAddItem_hook(ShopTraderInventorySection* s
     return ret;
 }
 
-// The "arrange" button (ShopTraderInventorySection::autoArrange) re-places the
-// shop's own sellable stock through the inherited InventorySection::_addItem we
-// hook, with the item transiently ownerless - which the ownerless-sale heuristic
-// misreads as a player sale and refuses (destroying the item). Snapshotting the
-// shop's inventory HERE, at the start of the arrange and before it mutates
-// anything, is the robust fix: it reads self->getInventory() directly (no reliance
-// on trade-open GUI state) and captures whatever is actually in the shop right now
-// - including goods the player legitimately sold earlier in this same trade, which
-// a trade-open snapshot would miss. Those pointers are stable across the re-place,
-// so activeTradeHadShopItem() then recognises them and they are not refused.
+// autoArrange re-places the shop's own stock through the hooked _addItem while the
+// item is transiently ownerless. Snapshotting self->getInventory() here (before it
+// mutates) lets activeTradeHadShopItem() recognise those items so they aren't
+// misread as a player sale; it also catches goods sold earlier in this trade.
 typedef void (*ShopTraderSectionAutoArrange_t)(ShopTraderInventorySection*);
 static ShopTraderSectionAutoArrange_t ShopTraderSectionAutoArrange_orig = NULL;
 static bool gDbgShopAutoArrangeFire = false;
@@ -2512,6 +2532,9 @@ static void updateActiveTradeContext(ForgottenGUI* self, RootObject* a, RootObje
                                      TradeWindowType tradeType)
 {
     gTrade.clear();
+    // Invalidate the pointer-keyed shop cache too: a freed shopkeeper whose
+    // address is later reused would otherwise hit gCtx and apply stale rules.
+    gCtx.clear();
     if (tradeType != TW_MONEY_TRADING) return;
     if (!InventoryGUI::isTradingForMoney_static()) return;
 
@@ -2573,14 +2596,32 @@ static void logTradeWindowOpen(const char* phase, ForgottenGUI* self, RootObject
     }
 }
 
-// Trade-window open is our stable reset point for per-trade state.
+// Trade-window open is our stable reset point for per-trade state. Guarded like
+// every other hook: a fault in engine setup or our context capture fails open.
 void (*_showTradeWindow_orig)(ForgottenGUI* thisptr, RootObject* a, RootObject* b, TradeWindowType tradeType);
 void _showTradeWindow_hook(ForgottenGUI* thisptr, RootObject* a, RootObject* b, TradeWindowType tradeType)
 {
-    logTradeWindowOpen("pre", thisptr, a, b, tradeType);
-    _showTradeWindow_orig(thisptr, a, b, tradeType);
-    updateActiveTradeContext(thisptr, a, b, tradeType);
-    logTradeWindowOpen("post", thisptr, a, b, tradeType);
+    __try
+    {
+        logTradeWindowOpen("pre", thisptr, a, b, tradeType);
+    }
+    __except (triiSehFilter("showTradeWindow.logPre", GetExceptionInformation())) {}
+
+    __try
+    {
+        _showTradeWindow_orig(thisptr, a, b, tradeType);
+    }
+    __except (triiSehFilter("showTradeWindow.orig", GetExceptionInformation()))
+    {
+        return;
+    }
+
+    __try
+    {
+        updateActiveTradeContext(thisptr, a, b, tradeType);
+        logTradeWindowOpen("post", thisptr, a, b, tradeType);
+    }
+    __except (triiSehFilter("showTradeWindow.ctx", GetExceptionInformation())) {}
 }
 
 static void refusalFeedbackGuarded(Character* speaker, Item* item)
@@ -2677,7 +2718,17 @@ static bool PlaceItemFromMouse_hook(InventoryGUI* self, const std::string& secti
             return false;
         }
     }
-    return PlaceItemFromMouse_orig(self, sectionName, mousePos);
+
+    bool ret = false;
+    __try
+    {
+        ret = PlaceItemFromMouse_orig(self, sectionName, mousePos);
+    }
+    __except (triiSehFilter("placeItemFromMouse.orig", GetExceptionInformation()))
+    {
+        return false;
+    }
+    return ret;
 }
 
 // ---------------------------------------------------------------------
