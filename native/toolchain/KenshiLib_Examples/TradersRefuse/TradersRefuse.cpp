@@ -1020,11 +1020,38 @@ static void logNoVendorListFound(RootObject* shop)
     DebugLog(buf);
 }
 
+// FCS squad-definition stringID (e.g. "56154-rebirth.mod") for the shop's placed
+// squad, lowercased; empty when unavailable. Pins trader behaviour to a specific
+// placed squad rather than a display name that can collide across the world.
+static std::string shopSquadTemplateID(RootObject* shop)
+{
+    if (!isCharacterType(shop)) return std::string();
+    ActivePlatoon* active = ((Character*)shop)->getPlatoon();
+    if (!readable(active, 8) || !readable(active->me, 8)) return std::string();
+    GameData* squad = active->me->squadTemplate;
+    if (!readable(squad, 8)) return std::string();
+    return toLower(squad->stringID);
+}
+
+// Squads whose trader accepts every item regardless of stock (leader trades as a
+// fence). Keyed on the FCS squad stringID so it targets exactly the placed squad.
+static bool squadIsAcceptAll(const std::string& squadId)
+{
+    if (squadId.empty()) return false;
+    static const char* kAcceptAllSquads[] = {
+        "56154-rebirth.mod",   // Quin - Scraphouse squad, Shem (accepts everything)
+    };
+    for (size_t i = 0; i < sizeof(kAcceptAllSquads) / sizeof(kAcceptAllSquads[0]); ++i)
+        if (squadId == toLower(kAcceptAllSquads[i])) return true;
+    return false;
+}
+
 static void deriveShopTraits(ShopContext& ctx)
 {
     std::string shopName = readable(ctx.shop, 8) ? normaliseName(safeName(ctx.shop)) : std::string();
     ctx.isThiefFence = shopName == "thief fence";
-    ctx.isAcceptAllVendor = ctx.isThiefFence || shopName == "shinobi trader";
+    ctx.isAcceptAllVendor = ctx.isThiefFence || shopName == "shinobi trader" ||
+        squadIsAcceptAll(shopSquadTemplateID(ctx.shop));
     ctx.isSkeletonVendor = isCharacterType(ctx.shop) && characterIsSkeleton((Character*)ctx.shop);
     ctx.sellsFood = ctx.stockCats.count(CAT_FOOD) > 0;
     ctx.sellsRobotics = stockLooksLikeRobotics(ctx);
@@ -1107,9 +1134,12 @@ static bool itemIsFoodForSale(Cat cat, const std::string& itemId)
 // The shop's real stock expands acceptance; otherwise fall back to the rule.
 static Disp dispositionFor(Cat cat, const std::string& itemId, double* reducedMult)
 {
+    // Accept-all vendors (fences, and squads pinned via squadIsAcceptAll like Quin)
+    // buy everything at full price - checked before the skeleton food guard so a
+    // skeleton accept-all trader still takes food.
+    if (gCtx.isAcceptAllVendor) return DISP_FULL;
     if (gCtx.isSkeletonVendor && !gCtx.sellsFood && itemIsFoodForSale(cat, itemId))
         return DISP_REFUSE;
-    if (gCtx.isAcceptAllVendor) return DISP_FULL;
 
     const Rule& rule = ruleFor(gCtx.archetype);
     if (cfg::useStockAcceptance && gCtx.haveStock)
