@@ -672,3 +672,31 @@ may consider it more useful to permit linking proprietary applications with
 the library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.  But first, please read
 <https://www.gnu.org/licenses/why-not-lgpl.html>.
+
+==============================================================================
+ADDITIONAL TERMS AND BRANDING RESTRICTIONS (GPLv3 SECTION 7)
+==============================================================================
+
+This software incorporates ReKenshi headers and is distributed as a derivative 
+work under the GNU General Public License version 3 (GPLv3). 
+
+Pursuant to Section 7 of the GPLv3, the original copyright holder (Sinuboh) 
+supplements the terms of the License with the following mandatory restrictions 
+and requirements regarding attribution, misrepresentation, and trademarks:
+
+1. NO IMPERSONATION: You are strictly prohibited from reuploading, hosting, 
+   or modifying this software under the username "Sinuboh", or otherwise 
+   implying that your upload is an official release, update, or endorsement 
+   by the original author.
+
+2. DISTINCT NAMING REQUIRED: Modified versions, alternative compilations, 
+   or platform mirrors of this software may NOT use the exact title 
+   "Traders Refuse Irrelevant Items". Any distributed copy must be given 
+   a distinctly unique name that clearly indicates it is an unofficial fork 
+   or mirror (e.g., "Traders Refuse Irrelevant Items - Unofficial Mirror").
+
+3. MANDATORY DISCLAIMER: Any public redistribution, reupload, or fork of 
+   this software must display a prominent notice in its documentation and 
+   store/workshop descriptions stating: 
+   "This is an unofficial fork/mirror. It is not maintained, supported, 
+   or endorsed by the original creator, Sinuboh."
