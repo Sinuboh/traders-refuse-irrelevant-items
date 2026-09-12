@@ -35,6 +35,7 @@
 #include <kenshi/Inventory.h>
 #include <kenshi/Character.h>
 #include <kenshi/Platoon.h>
+#include <kenshi/Faction.h>
 #include <kenshi/GameData.h>
 #include <kenshi/RaceData.h>
 #include <kenshi/Globals.h>
@@ -73,10 +74,15 @@ namespace cfg
 
     static const bool   payFullLocalPrice   = true;   // pay avg (local) price for accepted goods
     static const bool   playerSellValue     = true;   // getValueSingle(isPlayer) value that marks the sell side
-    static const int    refusedPreviewValue = 1;      // zero-value refused sales looked crash-prone in the UI
+    static const int    refusedPreviewValue = 0;      // TEST: was 1 (day-one assumption that "zero looked crash-prone" -
+                                                      // no commit ever verified it). 0 stops the money leak on refused
+                                                      // sales; if it CTDs, suspect getMaxAffordableNum div-by-zero on the
+                                                      // sell-all path (RVA 0x75C3B0), not the preview itself.
     static const bool   refuseUnknown       = false;  // false => allow unclassified (OTHER) items
     static const bool   useStockAcceptance  = true;   // the shop's real stock expands acceptance
     static const bool   strictVendorStockAcceptance = true; // stock categories describe shops; exact IDs approve sales
+    static const bool   enableWeaponTierAcceptance = true; // weapon shops buy any weapon at/above their lowest stocked
+                                                      // manufacturer "model value" tier, not just exact-stocked IDs
     static const bool   scanAllVendorRefs   = true;   // inspect FCS VENDOR_LIST refs on squad/shop/building data
     static const bool   acceptAllWhenNoVendorList = true; // missing vendor data means leave vanilla trading alone
     static const double offListFoodMult     = 0.6;    // most shops will still buy food, just at a worse price
@@ -359,6 +365,7 @@ struct ShopContext
     bool           isTradeShop;
     bool           sellsRobotics;
     bool           isWeaponsOnlyShop;
+    bool           sellsWeapons;
     bool           sellsArmorOrClothing;
     bool           isBar;
     bool           isThiefFence;
@@ -366,21 +373,25 @@ struct ShopContext
     bool           isSkeletonVendor;
     bool           sellsFood;
     bool           sellsBlueprints;
+    bool           hasWeaponModelTier;   // shop referenced >=1 weapon manufacturer with model values
+    int            minWeaponModelValue;  // lowest manufacturer "model value" tier the shop stocks
     int            liveStockItems;
     int            templateStockRefs;
 
     ShopContext() : shop(NULL), archetype("_default"), foundVendorList(false), haveStock(false),
         hasGeneralTradeAllowList(false), isTradeShop(false), sellsRobotics(false),
-        isWeaponsOnlyShop(false), sellsArmorOrClothing(false), isBar(false), isThiefFence(false),
-        isAcceptAllVendor(false), isSkeletonVendor(false), sellsFood(false), sellsBlueprints(false),
+        isWeaponsOnlyShop(false), sellsWeapons(false), sellsArmorOrClothing(false), isBar(false),
+        isThiefFence(false), isAcceptAllVendor(false), isSkeletonVendor(false), sellsFood(false),
+        sellsBlueprints(false), hasWeaponModelTier(false), minWeaponModelValue(0),
         liveStockItems(0), templateStockRefs(0) {}
     void clear()
     {
         shop = NULL; archetype = "_default"; foundVendorList = false; haveStock = false;
         stockCats.clear(); stockIds.clear(); stockNames.clear(); seenVendorLists.clear(); vendorListNames.clear();
         hasGeneralTradeAllowList = false; isTradeShop = false; sellsRobotics = false;
-        isWeaponsOnlyShop = false; sellsArmorOrClothing = false; isBar = false; isThiefFence = false;
-        isAcceptAllVendor = false; isSkeletonVendor = false; sellsFood = false; sellsBlueprints = false;
+        isWeaponsOnlyShop = false; sellsWeapons = false; sellsArmorOrClothing = false; isBar = false;
+        isThiefFence = false; isAcceptAllVendor = false; isSkeletonVendor = false; sellsFood = false;
+        sellsBlueprints = false; hasWeaponModelTier = false; minWeaponModelValue = 0;
         liveStockItems = 0; templateStockRefs = 0;
     }
 };
@@ -555,9 +566,39 @@ static Cat referenceListCategoryHint(GameData* vendor)
     return CAT_OTHER;
 }
 
+// World/loot drops with no natural vendor list (unique boss CPUs, animal eggs,
+// trophies, quest artifacts). The FCS force-accept lists omit these, so general
+// traders refused them despite the "general stores buy world-only items" intent.
+// Lowercase to match itemStringID(). Accepted only by trade shops (below).
+static bool isLootOnlyTradeItem(const std::string& itemId)
+{
+    static const char* const kLootTradeItemIds[] = {
+        "4029-gamedata.base",      // Beak Thing Egg
+        "56099-newwworld.mod",     // Crab Egg
+        "97662-rebirth.mod",       // Gurgler Egg
+        "42338-changes_otto.mod",  // Leviathan Pearl
+        "1533843-rebirth.mod",     // CPU of Cat-Lon
+        "1533859-rebirth.mod",     // CPU of Cat-Lon (variant)
+        "1533669-rebirth.mod",     // CPU of General Hat-12
+        "1533665-rebirth.mod",     // CPU of General Jang
+        "1533517-rebirth.mod",     // CPU of Rhinobot
+        "1533516-rebirth.mod",     // CPU of the Head of Agriculture
+        "1534121-__fixes.mod",     // Great White Claw
+        "98510-rebirth.mod",       // Great White Skin
+        "56122-rebirth.mod",       // Megacrab Ganglion
+        "50984-rebirth.mod",       // Horn of the Megaraptor
+        "57222-dialogue.mod",      // Chalice of Fire
+        "1533445-dialogue.mod",    // Holy Seal
+    };
+    return stringInList(itemId, kLootTradeItemIds,
+        sizeof(kLootTradeItemIds) / sizeof(kLootTradeItemIds[0]));
+}
+
 // Allows stores to buy obvious inputs for the things they sell, plus the
-// mod-owned force-allow list for general trade stores.
-static bool isShopSpecificAcceptedGood(const std::string& itemId, Cat cat)
+// mod-owned force-allow list for general trade stores. `item` (when supplied)
+// enables the weapon manufacturer-tier check.
+static bool isShopSpecificAcceptedGood(const std::string& itemId, Cat cat,
+                                       InventoryItemBase* item)
 {
     static const char* const roboticsInputIds[] = {
         "43395-changes_otto.mod", // Skeleton Muscle
@@ -585,6 +626,20 @@ static bool isShopSpecificAcceptedGood(const std::string& itemId, Cat cat)
     // so the sold blueprint's ID never matches stockIds - accept by category.
     if (gCtx.sellsBlueprints && cat == CAT_BLUEPRINT)
         return true;
+    // Armour quality comes from faction data the vendor refs don't expose, so a
+    // per-shop quality floor isn't readable - accept the whole category instead.
+    if (gCtx.sellsArmorOrClothing && cat == CAT_ARMOUR)
+        return true;
+    // Weapon shops buy any weapon whose quality tier is at or above the lowest
+    // tier they stock. Item::quality and the manufacturer "model value" floor are
+    // both on the 1..100 scale, so they compare directly. Unreadable quality
+    // accepts, rather than refusing a legit weapon over a read miss.
+    if (cfg::enableWeaponTierAcceptance && gCtx.sellsWeapons &&
+        (cat == CAT_WEAPON || cat == CAT_RANGED) && readable(item, 8))
+    {
+        if (item->quality < 0.0f || item->quality >= (float)gCtx.minWeaponModelValue)
+            return true;
+    }
     // A shop that stocks books buys any book (symmetric to bars/food).
     if (cat == CAT_BOOK && gCtx.stockCats.count(CAT_BOOK) > 0)
         return true;
@@ -601,7 +656,7 @@ static bool isShopSpecificAcceptedGood(const std::string& itemId, Cat cat)
         (setHasItemID(gFoodIds, itemId) || setHasItemID(gDrinkWaterIds, itemId)))
         return true;
     if (gCtx.isTradeShop &&
-        (cat == CAT_TRADEGOODS || isGeneralTradeAllowID(itemId)))
+        (cat == CAT_TRADEGOODS || isGeneralTradeAllowID(itemId) || isLootOnlyTradeItem(itemId)))
         return true;
     return false;
 }
@@ -882,6 +937,32 @@ static bool keyLooksLikeBlueprintList(const std::string& key)
     return toLower(key).find("blueprint") != std::string::npos;
 }
 
+// A WEAPON_MANUFACTURER holds a "weapon models" reference list; each row's first
+// TripleInt value is a model's "model value" tier (1..100). The shop's lowest
+// such value is its tier floor - a sold weapon's Item::quality (same 1..100
+// scale) is later compared against it.
+static void scanWeaponManufacturer(GameData* manufacturer, ShopContext& ctx)
+{
+    if (!manufacturer || manufacturer->type != WEAPON_MANUFACTURER) return;
+    for (GameDataReferenceMap::const_iterator it = manufacturer->objectReferences.begin();
+         it != manufacturer->objectReferences.end(); ++it)
+    {
+        if (toLower(it->first).find("model") == std::string::npos) continue;
+        const Ogre::vector<GameDataReference>::type& refs = it->second;
+        uint32_t scanned = refs.size() < cfg::maxStockScan ? (uint32_t)refs.size() : cfg::maxStockScan;
+        for (uint32_t j = 0; j < scanned; ++j)
+        {
+            int value = refs[j].values.value[0];
+            if (value <= 0 || value > 100) continue;
+            if (!ctx.hasWeaponModelTier || value < ctx.minWeaponModelValue)
+            {
+                ctx.minWeaponModelValue = value;
+                ctx.hasWeaponModelTier = true;
+            }
+        }
+    }
+}
+
 static void addVendorTemplateRefs(GameData* vendor, ShopContext& ctx)
 {
     if (!vendor) return;
@@ -907,7 +988,15 @@ static void addVendorTemplateRefs(GameData* vendor, ShopContext& ctx)
             const Ogre::vector<GameDataReference>::type& refs = it->second;
             uint32_t scanned = refs.size() < cfg::maxStockScan ? (uint32_t)refs.size() : cfg::maxStockScan;
             for (uint32_t j = 0; j < scanned; ++j)
+            {
+                // Weapon manufacturers carry the model-value tiers, not sellable
+                // stock, so they never pass gameDataTypeCanBeShopStock - handle
+                // them here before addStockGameData drops them.
+                if (cfg::enableWeaponTierAcceptance && refs[j].ptr &&
+                    refs[j].ptr->type == WEAPON_MANUFACTURER)
+                    scanWeaponManufacturer(refs[j].ptr, ctx);
                 addStockGameData(vendor, refs[j].ptr, hint, it->first, (int)j, ctx);
+            }
         }
     }
     else
@@ -1046,16 +1135,39 @@ static bool squadIsAcceptAll(const std::string& squadId)
     return false;
 }
 
+// Fencing traders are the Shinobi Thieves' fences. Their placed characters carry
+// a range of display names (Thief Fence, Shinobi Trader, ...), so back the name
+// hints with a faction check: any shopkeeper whose faction is the Shinobi Thieves
+// trades as a fence. Keyed on the faction name/stringID (vanilla "17-gamedata.base").
+static bool shopFactionIsThievesGuild(RootObject* shop)
+{
+    if (!isCharacterType(shop)) return false;
+    Ownerships* own = ((Character*)shop)->getOwnerships();
+    if (!readable(own, 8)) return false;
+    Faction* faction = own->faction;
+    if (!readable(faction, 8)) return false;
+
+    std::string key = toLower(faction->getName());
+    GameData* data = faction->getData();
+    if (readable(data, 8))
+        key += " " + toLower(data->stringID);
+
+    return key.find("shinobi thieves") != std::string::npos ||
+        key.find("17-gamedata.base") != std::string::npos;
+}
+
 static void deriveShopTraits(ShopContext& ctx)
 {
     std::string shopName = readable(ctx.shop, 8) ? normaliseName(safeName(ctx.shop)) : std::string();
-    ctx.isThiefFence = shopName == "thief fence";
+    ctx.isThiefFence = shopName == "thief fence" || shopFactionIsThievesGuild(ctx.shop);
     ctx.isAcceptAllVendor = ctx.isThiefFence || shopName == "shinobi trader" ||
         squadIsAcceptAll(shopSquadTemplateID(ctx.shop));
     ctx.isSkeletonVendor = isCharacterType(ctx.shop) && characterIsSkeleton((Character*)ctx.shop);
     ctx.sellsFood = ctx.stockCats.count(CAT_FOOD) > 0;
     ctx.sellsRobotics = stockLooksLikeRobotics(ctx);
     ctx.isWeaponsOnlyShop = stockHasOnlyWeaponGoods(ctx.stockCats);
+    ctx.sellsWeapons = ctx.stockCats.count(CAT_WEAPON) > 0 || ctx.stockCats.count(CAT_RANGED) > 0 ||
+        ctx.archetype == "weaponsmith";
     ctx.sellsArmorOrClothing = ctx.stockCats.count(CAT_ARMOUR) > 0 || ctx.archetype == "armoursmith";
     ctx.isBar = ctx.archetype == "bar" || ctx.stockCats.count(CAT_BOOZE) > 0;
     ctx.isTradeShop = ctx.hasGeneralTradeAllowList ||
@@ -1089,14 +1201,15 @@ static void ensureContext(RootObject* shop, Inventory* stockInv)
         std::string stockNames = stockNameSummary(gCtx.stockNames);
         char buf[1280];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "[TRII][shop] name=%s archetype=%s foundVendorList=%d haveStock=%d stockCats=%d stockCatList=%s stockIds=%d stockNames=%d stockNameSample=%s vendorLists=%d vendorListNames=%s tradeAllowList=%d tradeShop=%d robotics=%d weaponOnly=%d armour=%d bar=%d thiefFence=%d acceptAll=%d skeletonVendor=%d sellsFood=%d sellsBlueprints=%d liveItems=%d templateRefs=%d",
+            "[TRII][shop] name=%s archetype=%s foundVendorList=%d haveStock=%d stockCats=%d stockCatList=%s stockIds=%d stockNames=%d stockNameSample=%s vendorLists=%d vendorListNames=%s tradeAllowList=%d tradeShop=%d robotics=%d weaponOnly=%d sellsWeapons=%d armour=%d bar=%d thiefFence=%d acceptAll=%d skeletonVendor=%d sellsFood=%d sellsBlueprints=%d weaponTier=%d minModelValue=%d liveItems=%d templateRefs=%d",
             safeName(shop).c_str(), gCtx.archetype.c_str(), (int)gCtx.foundVendorList, (int)gCtx.haveStock,
             (int)gCtx.stockCats.size(), cats.c_str(), (int)gCtx.stockIds.size(), (int)gCtx.stockNames.size(),
             stockNames.c_str(), (int)gCtx.vendorListNames.size(), vendorLists.c_str(),
             (int)gCtx.hasGeneralTradeAllowList, (int)gCtx.isTradeShop, (int)gCtx.sellsRobotics,
-            (int)gCtx.isWeaponsOnlyShop, (int)gCtx.sellsArmorOrClothing, (int)gCtx.isBar,
+            (int)gCtx.isWeaponsOnlyShop, (int)gCtx.sellsWeapons, (int)gCtx.sellsArmorOrClothing, (int)gCtx.isBar,
             (int)gCtx.isThiefFence, (int)gCtx.isAcceptAllVendor, (int)gCtx.isSkeletonVendor,
-            (int)gCtx.sellsFood, (int)gCtx.sellsBlueprints, gCtx.liveStockItems, gCtx.templateStockRefs);
+            (int)gCtx.sellsFood, (int)gCtx.sellsBlueprints, (int)gCtx.hasWeaponModelTier,
+            gCtx.minWeaponModelValue, gCtx.liveStockItems, gCtx.templateStockRefs);
         DebugLog(buf);
     }
 }
@@ -1132,7 +1245,9 @@ static bool itemIsFoodForSale(Cat cat, const std::string& itemId)
 }
 
 // The shop's real stock expands acceptance; otherwise fall back to the rule.
-static Disp dispositionFor(Cat cat, const std::string& itemId, double* reducedMult)
+// `item` (optional) supplies the weapon manufacturer-tier check.
+static Disp dispositionFor(Cat cat, const std::string& itemId, double* reducedMult,
+                           InventoryItemBase* item = NULL)
 {
     // Accept-all vendors (fences, and squads pinned via squadIsAcceptAll like Quin)
     // buy everything at full price - checked before the skeleton food guard so a
@@ -1145,7 +1260,7 @@ static Disp dispositionFor(Cat cat, const std::string& itemId, double* reducedMu
     if (cfg::useStockAcceptance && gCtx.haveStock)
     {
         if (!itemId.empty() && gCtx.stockIds.count(itemId)) return DISP_FULL;
-        if (isShopSpecificAcceptedGood(itemId, cat)) return DISP_FULL;
+        if (isShopSpecificAcceptedGood(itemId, cat, item)) return DISP_FULL;
         if (cfg::strictVendorStockAcceptance)
         {
             if (itemIsFoodForSale(cat, itemId))
@@ -1267,7 +1382,14 @@ static std::string itemStringID(InventoryItemBase* item)
 typedef int (*GetValueSingle_t)(InventoryItemBase*, bool);
 static GetValueSingle_t GetValueSingle_orig = NULL;
 
+// getValueAll (RVA 0x790350) prices a whole stack and is a SEPARATE engine
+// function from getValueSingle - so a refused/repriced stack sold via the stack
+// path would otherwise be valued (and paid) at full price, bypassing repricing.
+typedef int (*GetValueAll_t)(InventoryItemBase*, bool);
+static GetValueAll_t GetValueAll_orig = NULL;
+
 static bool gDbgValueFire = false;
+static bool gDbgValueAllFire = false;
 static bool gDbgValueSell = false;
 static std::set<std::string> gSeenValueProfiles;
 
@@ -1286,6 +1408,39 @@ static float safeTraderPriceMultiplier()
     return mult;
 }
 
+// InventoryItemBase::merchantPriceMod() is the item's *local* (regional) price
+// modifier - the same town-economy factor the engine folds into a real buy/sell
+// price. It is protected, so reach it through a derived-cast accessor (the
+// IGUIHookAccess pattern); we never instantiate this type.
+struct ItemPriceAccess : public InventoryItemBase
+{
+    static float merchantMod(InventoryItemBase* item)
+    {
+        return static_cast<ItemPriceAccess*>(item)->merchantPriceMod();
+    }
+};
+
+// getAvgPrice() is the *global* base value with no regional adjustment. Paying
+// that as the "full local price" overpays in cheap regions (and underpays in
+// expensive ones): the player could buy grog low and sell it back higher for
+// free money. Fold the regional modifier back in so the value we pay tracks the
+// same local price the shop bought at.
+static float safeMerchantPriceMod(InventoryItemBase* item)
+{
+    if (!readable(item, 8)) return 1.0f;
+    float mod = 1.0f;
+    __try
+    {
+        mod = ItemPriceAccess::merchantMod(item);
+    }
+    __except (triiSehFilter("value.merchantMod", GetExceptionInformation()))
+    {
+        return 1.0f;
+    }
+    if (mod < 0.01f || mod > 100.0f) return 1.0f;
+    return mod;
+}
+
 // Pre-divide by the trader's global price multiplier so the engine's own later
 // multiply lands back on the local price we actually want to pay.
 static int cancelTraderSellMultiplier(int desiredValue, float traderMult)
@@ -1298,7 +1453,8 @@ static int cancelTraderSellMultiplier(int desiredValue, float traderMult)
 }
 
 static void logValueDecision(InventoryItemBase* item, Cat cat, Disp disp,
-                             int base, int avg, int returned, float traderMult)
+                             int base, int avg, int returned, float traderMult,
+                             int buyValue = -1)
 {
     if (!cfg::debug) return;
     if (gSeenValueProfiles.size() >= 80) return;
@@ -1310,20 +1466,33 @@ static void logValueDecision(InventoryItemBase* item, Cat cat, Disp disp,
     if (gSeenValueProfiles.find(key) != gSeenValueProfiles.end()) return;
     gSeenValueProfiles.insert(key);
 
-    char buf[384];
+    // Diagnostic for weapon-tier calibration: item quality + manufacturer vs the
+    // shop's resolved model-value floor. Lets us see which scale `quality` uses.
+    float quality = readable(item, 8) ? item->quality : -1.0f;
+    GameData* manuf = readable(item, 8) ? item->manufacturerData : NULL;
+    std::string manufId = readable(manuf, 8) ? manuf->stringID : std::string();
+    std::string manufName = readable(manuf, 8) ? manuf->name : std::string();
+
+    char buf[512];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-        "[TRII][item] shop=%s archetype=%s item=%s itemId=%s section=%s fn=%d cat=%s disp=%s base=%d avg=%d ret=%d traderMult=%.3f stockCats=%d stockIds=%d stockNames=%d",
+        "[TRII][item] shop=%s archetype=%s item=%s itemId=%s section=%s fn=%d cat=%s disp=%s base=%d avg=%d buyValue=%d ret=%d traderMult=%.3f quality=%.3f manuf=%s/%s minModelValue=%d stockCats=%d stockIds=%d stockNames=%d",
         safeName(gCtx.shop).c_str(), gCtx.archetype.c_str(), itemName.c_str(), itemId.c_str(), section.c_str(),
         item ? (int)item->itemFunction : -1, catLabel(cat), dispLabel(disp),
-        base, avg, returned, traderMult, (int)gCtx.stockCats.size(),
+        base, avg, buyValue, returned, traderMult, quality, manufName.c_str(), manufId.c_str(),
+        gCtx.minWeaponModelValue, (int)gCtx.stockCats.size(),
         (int)gCtx.stockIds.size(), (int)gCtx.stockNames.size());
     DebugLog(buf);
 }
 
 // All the C++ logic (std::string/std::set locals) lives here so the SEH shell
 // below stays free of objects that need unwinding (MSVC C2712).
-static int GetValueSingle_impl(InventoryItemBase* self, bool isPlayer, int base)
+//
+// Shared repricing decision: returns the repriced *single-item* value and, via
+// dispOut, the disposition. Both the getValueSingle and getValueAll hooks call
+// this so a stack sale is priced/refused identically to a single sale.
+static int repriceSingleValue(InventoryItemBase* self, bool isPlayer, int base, Disp* dispOut)
 {
+    if (dispOut) *dispOut = DISP_FULL;
     if (!cfg::enabled || !cfg::enableValueHook) return base;
     if (isPlayer != cfg::playerSellValue) return base;  // sell side only - cheap gate
                                                         // FIRST so non-sell/world
@@ -1342,7 +1511,8 @@ static int GetValueSingle_impl(InventoryItemBase* self, bool isPlayer, int base)
 
     Cat cat = classifyByFunctionAndSection(self);
     double mult = 1.0;
-    Disp disp = dispositionFor(cat, itemStringID(self), &mult);
+    Disp disp = dispositionFor(cat, itemStringID(self), &mult, self);
+    if (dispOut) *dispOut = disp;
     float traderMult = safeTraderPriceMultiplier();
 
     if (gCtx.isAcceptAllVendor && disp == DISP_FULL)
@@ -1361,23 +1531,65 @@ static int GetValueSingle_impl(InventoryItemBase* self, bool isPlayer, int base)
         logValueDecision(self, cat, disp, base, -1, base, traderMult);
         return base;
     }
+    float localMod = safeMerchantPriceMod(self);
+    // The player can always re-buy at the shop's buy price, so paying more than
+    // that to buy the item back is a money pump (buy 925, our sell 1155 -> +230).
+    // getValueSingle(isPlayer=false) is the buy-side value in the same units we
+    // return, and the engine display-transforms both sides identically, so
+    // clamping our return to it guarantees sell <= buy regardless of multipliers.
+    int buyValue = GetValueSingle_orig ? GetValueSingle_orig(self, false) : 0;
     if (disp == DISP_REDUCED)
     {
         int avg = self->getAvgPrice();
-        int desired = (int)std::floor(avg * mult);
+        int desired = (int)std::floor(avg * localMod * mult);
         int ret = cancelTraderSellMultiplier(desired, traderMult);
-        logValueDecision(self, cat, disp, base, avg, ret, traderMult);
+        if (buyValue > 0 && ret > buyValue) ret = buyValue;
+        logValueDecision(self, cat, disp, base, avg, ret, traderMult, buyValue);
         return ret;
     }
     if (disp == DISP_FULL && cfg::payFullLocalPrice)
     {
         int avg = self->getAvgPrice();
-        int ret = cancelTraderSellMultiplier(avg, traderMult);
-        logValueDecision(self, cat, disp, base, avg, ret, traderMult);
+        int desired = (int)std::floor(avg * localMod);
+        int ret = cancelTraderSellMultiplier(desired, traderMult);
+        if (buyValue > 0 && ret > buyValue) ret = buyValue;
+        logValueDecision(self, cat, disp, base, avg, ret, traderMult, buyValue);
         return ret;
     }
     logValueDecision(self, cat, disp, base, -1, base, traderMult);
     return base;
+}
+
+static int GetValueSingle_impl(InventoryItemBase* self, bool isPlayer, int base)
+{
+    return repriceSingleValue(self, isPlayer, base, NULL);
+}
+
+// Stack valuation. Reprice per item via the shared decision, then scale by
+// quantity so N items in a stack are priced exactly like N single sales. A
+// refused stack collapses to the flat refused sentinel (0 while testing) so the
+// engine pays nothing for goods the shop won't take, even down the stack path.
+static int GetValueAll_impl(InventoryItemBase* self, bool isPlayer, int base)
+{
+    if (!cfg::enabled || !cfg::enableValueHook) return base;
+    if (isPlayer != cfg::playerSellValue) return base;
+    if (!readable(self, 8)) { triiNote("valueAll: unreadable item ptr"); return base; }
+
+    Character* shop = InventoryGUI::getNPCTrader();
+    if (!shop) return base;
+    if (!readable(shop, 8)) { triiNote("valueAll: unreadable trader ptr"); return base; }
+
+    // The true per-item base comes from the original single valuation (bypassing
+    // our own hook), so repricing lands on the same number the single path uses.
+    int singleBase = GetValueSingle_orig ? GetValueSingle_orig(self, isPlayer) : 0;
+    Disp disp = DISP_FULL;
+    int perItem = repriceSingleValue(self, isPlayer, singleBase, &disp);
+
+    if (disp == DISP_REFUSE) return cfg::refusedPreviewValue;
+    if (cfg::observeOnly) return base;
+
+    int qty = self->quantity > 0 ? self->quantity : 1;
+    return perItem * qty;
 }
 
 static int GetValueSingle_hook(InventoryItemBase* self, bool isPlayer)
@@ -1402,6 +1614,30 @@ static int GetValueSingle_hook(InventoryItemBase* self, bool isPlayer)
         return GetValueSingle_impl(self, isPlayer, base);
     }
     __except (triiSehFilter("value.logic", GetExceptionInformation()))
+    {
+        return base;
+    }
+}
+
+static int GetValueAll_hook(InventoryItemBase* self, bool isPlayer)
+{
+    onceLog(gDbgValueAllFire, "TradersRefuse: [bc] valueAll hook first fire");
+
+    int base = 0;
+    __try
+    {
+        base = GetValueAll_orig(self, isPlayer);
+    }
+    __except (triiSehFilter("valueAll.orig (hook plumbing)", GetExceptionInformation()))
+    {
+        return 0;
+    }
+
+    __try
+    {
+        return GetValueAll_impl(self, isPlayer, base);
+    }
+    __except (triiSehFilter("valueAll.logic", GetExceptionInformation()))
     {
         return base;
     }
@@ -1742,7 +1978,7 @@ static bool analysePlayerSaleToShop(Inventory* destInv, Item* item, int quantity
     if (readable(shop, 8) && readable(item, 8))
     {
         ensureContext(shop, destInv);
-        disp = dispositionFor(cat, itemStringID(item), NULL);
+        disp = dispositionFor(cat, itemStringID(item), NULL, item);
     }
     if (catOut) *catOut = cat;
     if (dispOut) *dispOut = disp;
@@ -1844,8 +2080,11 @@ static bool shouldRefuseAddItemImpl(Inventory* self, Item* itemToAdd, int quanti
         &destOwner, &shop, &sourceOwner, &properOwner, &cat, &disp,
         &destIsShop, &sourceIsPlayer, &ownerlessPlayerSale);
 
+    // Backpacks-with-contents are blocked so refused contents can't ride into a
+    // shop inside an accepted bag - but an accept-all vendor takes the contents
+    // too, so there's nothing to smuggle and the sale should go through.
     int protectedContainerItems = readable(itemToAdd, 8) ? backpackContainerContentCount(itemToAdd) : 0;
-    bool protectContainerContents = playerSale && protectedContainerItems > 0;
+    bool protectContainerContents = playerSale && protectedContainerItems > 0 && !gCtx.isAcceptAllVendor;
     if (!playerSale || (disp != DISP_REFUSE && !protectContainerContents)) return false;
     Character* npc = InventoryGUI::getNPCTrader();
     if (readable(npc, 8)) *speaker = npc;
@@ -2709,7 +2948,10 @@ static bool shouldRefuseMousePlaceImpl(InventoryGUI* self, const std::string& se
         DebugLog(buf);
     }
 
-    if (!playerSale || (disp != DISP_REFUSE && protectedContainerItems <= 0)) return false;
+    // See shouldRefuseAddItemImpl: accept-all vendors take bag contents too, so
+    // the container-contents block doesn't apply to them.
+    bool protectContainerContents = protectedContainerItems > 0 && !gCtx.isAcceptAllVendor;
+    if (!playerSale || (disp != DISP_REFUSE && !protectContainerContents)) return false;
 
     Character* npc = InventoryGUI::getNPCTrader();
     if (readable(npc, 8)) *speaker = npc;
@@ -2782,6 +3024,11 @@ __declspec(dllexport) void startPlugin()
         bool ok = (KenshiLib::SUCCESS == KenshiLib::AddHook(addr, GetValueSingle_hook, &GetValueSingle_orig));
         logAddr("getValueSingle", addr, ok);
         if (!ok) ErrorLog("TradersRefuse: could not hook getValueSingle");
+
+        intptr_t allAddr = KenshiLib::GetRealAddress(&InventoryItemBase::_NV_getValueAll);
+        bool allOk = (KenshiLib::SUCCESS == KenshiLib::AddHook(allAddr, GetValueAll_hook, &GetValueAll_orig));
+        logAddr("getValueAll", allAddr, allOk);
+        if (!allOk) ErrorLog("TradersRefuse: could not hook getValueAll");
     }
 
     if (cfg::enablePlaceItemFromMouseHook)
